@@ -16,14 +16,11 @@ struct Camera {
 @group(0) @binding(1) var tileSampler: sampler;
 @group(0) @binding(2) var tileTexture: texture_2d<f32>;
 
-struct TileInstance {
-  minX: f32,
-  minY: f32,
-  maxX: f32,
-  maxY: f32,
+struct VertexInput {
+  @location(0) corner: vec2f,      // 0-1 normalized corner position
+  @location(1) tileBoundsMin: vec2f, // minX, minY
+  @location(2) tileBoundsMax: vec2f, // maxX, maxY
 };
-
-@group(0) @binding(3) var<uniform> tile: TileInstance;
 
 struct VertexOutput {
   @builtin(position) position: vec4f,
@@ -31,24 +28,13 @@ struct VertexOutput {
 };
 
 @vertex
-fn vs_main(@builtin(vertex_index) vIdx: u32) -> VertexOutput {
-  // Quad vertices (2 triangles)
-  var positions: array<vec2f, 6> = array<vec2f, 6>(
-    vec2f(0.0, 0.0),
-    vec2f(1.0, 0.0),
-    vec2f(0.0, 1.0),
-    vec2f(0.0, 1.0),
-    vec2f(1.0, 0.0),
-    vec2f(1.0, 1.0),
-  );
-  
-  let p = positions[vIdx];
-  let worldX = mix(tile.minX, tile.maxX, p.x);
-  let worldY = mix(tile.minY, tile.maxY, p.y);
+fn vs_main(input: VertexInput) -> VertexOutput {
+  let worldX = mix(input.tileBoundsMin.x, input.tileBoundsMax.x, input.corner.x);
+  let worldY = mix(input.tileBoundsMin.y, input.tileBoundsMax.y, input.corner.y);
   
   var out: VertexOutput;
   out.position = camera.projection * camera.view * vec4f(worldX, worldY, 0.0, 1.0);
-  out.uv = vec2f(p.x, 1.0 - p.y); // Flip Y for texture
+  out.uv = vec2f(input.corner.x, 1.0 - input.corner.y); // Flip Y for texture
   return out;
 }
 
@@ -197,7 +183,8 @@ export class WebGPURenderer {
   private nodeBuffer: GPUBuffer | null = null;
   private edgeBuffer: GPUBuffer | null = null;
   private uniformBuffer: GPUBuffer | null = null;
-  private tileUniformBuffer: GPUBuffer | null = null;
+  private tileVertexBuffer: GPUBuffer | null = null;
+  private tileBindGroupLayout: GPUBindGroupLayout | null = null;
 
   // Bind Groups
   private nodeBindGroup: GPUBindGroup | null = null;
@@ -276,13 +263,32 @@ export class WebGPURenderer {
   private async initPipelines() {
     if (!this.device) return;
 
-    // Tile Pipeline
+    // Tile bind group layout
+    this.tileBindGroupLayout = this.device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+      ],
+    });
+
+    // Tile Pipeline with vertex buffers
     const tileModule = this.device.createShaderModule({ code: TILE_SHADER });
     this.tilePipeline = this.device.createRenderPipeline({
-      layout: 'auto',
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [this.tileBindGroupLayout],
+      }),
       vertex: {
         module: tileModule,
         entryPoint: 'vs_main',
+        buffers: [{
+          arrayStride: 24, // 6 floats: corner(2) + boundsMin(2) + boundsMax(2)
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: 'float32x2' },  // corner
+            { shaderLocation: 1, offset: 8, format: 'float32x2' },  // tileBoundsMin
+            { shaderLocation: 2, offset: 16, format: 'float32x2' }, // tileBoundsMax
+          ],
+        }],
       },
       fragment: {
         module: tileModule,
@@ -387,12 +393,6 @@ export class WebGPURenderer {
     // Uniform buffer: mat4x4 projection (64) + mat4x4 view (64) + vec2 viewport (8) + float scale (4) + pad (4) = 144 bytes
     this.uniformBuffer = this.device.createBuffer({
       size: 144,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-
-    // Tile uniform buffer: 4 floats (minX, minY, maxX, maxY) = 16 bytes
-    this.tileUniformBuffer = this.device.createBuffer({
-      size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -516,7 +516,7 @@ export class WebGPURenderer {
     });
 
     // Draw tiles (basemap) first
-    if (this.basemapEnabled && this.tilePipeline && this.tileSampler && this.tileUniformBuffer) {
+    if (this.basemapEnabled && this.tilePipeline && this.tileSampler && this.tileBindGroupLayout) {
       this.renderTiles(renderPass);
     }
 
@@ -541,7 +541,7 @@ export class WebGPURenderer {
   };
 
   private renderTiles(renderPass: GPURenderPassEncoder) {
-    if (!this.device || !this.tilePipeline || !this.tileSampler || !this.uniformBuffer || !this.tileUniformBuffer) return;
+    if (!this.device || !this.tilePipeline || !this.tileSampler || !this.uniformBuffer || !this.tileBindGroupLayout) return;
 
     // Calculate absolute camera position
     const absCenterX = this.worldCenterX + this.camera.centerX;
@@ -558,6 +558,12 @@ export class WebGPURenderer {
 
     renderPass.setPipeline(this.tilePipeline);
 
+    // Quad corners: 6 vertices for 2 triangles
+    const corners = [
+      [0, 0], [1, 0], [0, 1],
+      [0, 1], [1, 0], [1, 1],
+    ];
+
     for (const tile of tiles) {
       const texture = this.getOrCreateTileTexture(tile);
       if (!texture) continue; // Skip tiles that aren't loaded yet
@@ -566,29 +572,44 @@ export class WebGPURenderer {
       const bounds = tileBounds(tile);
 
       // Convert to local coordinates (relative to world center)
-      const localBounds = {
-        minX: bounds.minX - this.worldCenterX,
-        minY: bounds.minY - this.worldCenterY,
-        maxX: bounds.maxX - this.worldCenterX,
-        maxY: bounds.maxY - this.worldCenterY,
-      };
+      const minX = bounds.minX - this.worldCenterX;
+      const minY = bounds.minY - this.worldCenterY;
+      const maxX = bounds.maxX - this.worldCenterX;
+      const maxY = bounds.maxY - this.worldCenterY;
 
-      // Update tile uniform buffer
-      const tileData = new Float32Array([localBounds.minX, localBounds.minY, localBounds.maxX, localBounds.maxY]);
-      this.device.queue.writeBuffer(this.tileUniformBuffer, 0, tileData);
+      // Create vertex data for this tile: 6 vertices × 6 floats each
+      const vertexData = new Float32Array(36);
+      for (let i = 0; i < 6; i++) {
+        const offset = i * 6;
+        vertexData[offset + 0] = corners[i][0]; // corner.x
+        vertexData[offset + 1] = corners[i][1]; // corner.y
+        vertexData[offset + 2] = minX;          // boundsMin.x
+        vertexData[offset + 3] = minY;          // boundsMin.y
+        vertexData[offset + 4] = maxX;          // boundsMax.x
+        vertexData[offset + 5] = maxY;          // boundsMax.y
+      }
+
+      // Create vertex buffer for this tile
+      const vertexBuffer = this.device.createBuffer({
+        size: vertexData.byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        mappedAtCreation: true,
+      });
+      new Float32Array(vertexBuffer.getMappedRange()).set(vertexData);
+      vertexBuffer.unmap();
 
       // Create bind group for this tile
       const tileBindGroup = this.device.createBindGroup({
-        layout: this.tilePipeline.getBindGroupLayout(0),
+        layout: this.tileBindGroupLayout,
         entries: [
           { binding: 0, resource: { buffer: this.uniformBuffer } },
           { binding: 1, resource: this.tileSampler },
           { binding: 2, resource: texture.createView() },
-          { binding: 3, resource: { buffer: this.tileUniformBuffer } },
         ],
       });
 
       renderPass.setBindGroup(0, tileBindGroup);
+      renderPass.setVertexBuffer(0, vertexBuffer);
       renderPass.draw(6);
     }
   }
