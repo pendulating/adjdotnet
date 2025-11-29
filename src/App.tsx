@@ -3,6 +3,7 @@ import './App.css';
 import { WebGPURenderer } from './lib/renderer';
 import { GraphState } from './lib/graph-state';
 import { DuckDBLayer } from './lib/duckdb';
+import { TILE_PROVIDERS } from './lib/tile-layer';
 
 interface NetworkMetadata {
   center_x: number;
@@ -10,12 +11,21 @@ interface NetworkMetadata {
   crs: string;
 }
 
+const BASEMAP_OPTIONS = [
+  { id: 'cartoDark', label: 'Dark' },
+  { id: 'cartoLight', label: 'Light' },
+  { id: 'cartoVoyager', label: 'Voyager' },
+  { id: 'osm', label: 'OpenStreetMap' },
+] as const;
+
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<WebGPURenderer | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [stats, setStats] = useState({ nodes: 0, edges: 0, fps: 0 });
+  const [basemapEnabled, setBasemapEnabled] = useState(true);
+  const [basemapStyle, setBasemapStyle] = useState<string>('cartoDark');
 
   // Pan/zoom state
   const isDragging = useRef(false);
@@ -68,6 +78,10 @@ function App() {
         canvas.height = rect.height * dpr;
 
         const renderer = new WebGPURenderer(canvas, graph);
+        
+        // Set world center for tile coordinate conversion
+        renderer.setWorldCenter(metadata.center_x, metadata.center_y);
+        
         await renderer.init();
 
         if (cancelled) {
@@ -157,6 +171,22 @@ function App() {
     rendererRef.current.setCamera(0, 0, 0.1);
   }, []);
 
+  const toggleBasemap = useCallback(() => {
+    setBasemapEnabled(prev => {
+      const next = !prev;
+      rendererRef.current?.setBasemapEnabled(next);
+      return next;
+    });
+  }, []);
+
+  const changeBasemapStyle = useCallback((styleId: string) => {
+    setBasemapStyle(styleId);
+    const provider = TILE_PROVIDERS[styleId as keyof typeof TILE_PROVIDERS];
+    if (provider && rendererRef.current) {
+      rendererRef.current.setTileProvider(provider);
+    }
+  }, []);
+
   if (error) {
     return (
       <div className="error-overlay">
@@ -180,6 +210,25 @@ function App() {
         {!loading && (
           <div className="controls">
             <button onClick={resetView}>Reset View</button>
+            <button 
+              onClick={toggleBasemap}
+              className={basemapEnabled ? 'active' : ''}
+            >
+              {basemapEnabled ? 'Hide Map' : 'Show Map'}
+            </button>
+          </div>
+        )}
+        {!loading && basemapEnabled && (
+          <div className="basemap-selector">
+            {BASEMAP_OPTIONS.map(opt => (
+              <button
+                key={opt.id}
+                onClick={() => changeBasemapStyle(opt.id)}
+                className={basemapStyle === opt.id ? 'active' : ''}
+              >
+                {opt.label}
+              </button>
+            ))}
           </div>
         )}
       </div>

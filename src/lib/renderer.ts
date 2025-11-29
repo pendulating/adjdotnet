@@ -1,5 +1,62 @@
 import { GraphState } from './graph-state';
 import { mat4 } from 'wgpu-matrix';
+import { TileCache, tileBounds, getVisibleTiles, TILE_PROVIDERS } from './tile-layer';
+import type { TileCoord, TileProvider } from './tile-layer';
+
+const TILE_SHADER = `
+struct Camera {
+  projection: mat4x4f,
+  view: mat4x4f,
+  viewport: vec2f,
+  scale: f32,
+  _pad: f32,
+};
+
+@group(0) @binding(0) var<uniform> camera: Camera;
+@group(0) @binding(1) var tileSampler: sampler;
+@group(0) @binding(2) var tileTexture: texture_2d<f32>;
+
+struct TileInstance {
+  minX: f32,
+  minY: f32,
+  maxX: f32,
+  maxY: f32,
+};
+
+@group(0) @binding(3) var<uniform> tile: TileInstance;
+
+struct VertexOutput {
+  @builtin(position) position: vec4f,
+  @location(0) uv: vec2f,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vIdx: u32) -> VertexOutput {
+  // Quad vertices (2 triangles)
+  var positions: array<vec2f, 6> = array<vec2f, 6>(
+    vec2f(0.0, 0.0),
+    vec2f(1.0, 0.0),
+    vec2f(0.0, 1.0),
+    vec2f(0.0, 1.0),
+    vec2f(1.0, 0.0),
+    vec2f(1.0, 1.0),
+  );
+  
+  let p = positions[vIdx];
+  let worldX = mix(tile.minX, tile.maxX, p.x);
+  let worldY = mix(tile.minY, tile.maxY, p.y);
+  
+  var out: VertexOutput;
+  out.position = camera.projection * camera.view * vec4f(worldX, worldY, 0.0, 1.0);
+  out.uv = vec2f(p.x, 1.0 - p.y); // Flip Y for texture
+  return out;
+}
+
+@fragment
+fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
+  return textureSample(tileTexture, tileSampler, uv);
+}
+`;
 
 const NODE_SHADER = `
 struct Camera {
@@ -134,15 +191,25 @@ export class WebGPURenderer {
   // Pipelines
   private nodePipeline: GPURenderPipeline | null = null;
   private edgePipeline: GPURenderPipeline | null = null;
+  private tilePipeline: GPURenderPipeline | null = null;
 
   // Buffers
   private nodeBuffer: GPUBuffer | null = null;
   private edgeBuffer: GPUBuffer | null = null;
   private uniformBuffer: GPUBuffer | null = null;
+  private tileUniformBuffer: GPUBuffer | null = null;
 
   // Bind Groups
   private nodeBindGroup: GPUBindGroup | null = null;
   private edgeBindGroup: GPUBindGroup | null = null;
+
+  // Tile Layer
+  private tileCache: TileCache;
+  private tileTextures = new Map<string, GPUTexture>();
+  private tileSampler: GPUSampler | null = null;
+  private basemapEnabled = true;
+  private worldCenterX = 0; // Absolute Web Mercator center
+  private worldCenterY = 0;
 
   // Camera
   public camera: CameraState = { centerX: 0, centerY: 0, zoom: 1 };
@@ -157,6 +224,23 @@ export class WebGPURenderer {
   constructor(canvas: HTMLCanvasElement, graphState: GraphState) {
     this.canvas = canvas;
     this.graphState = graphState;
+    this.tileCache = new TileCache(TILE_PROVIDERS.cartoDark);
+  }
+
+  public setWorldCenter(x: number, y: number) {
+    this.worldCenterX = x;
+    this.worldCenterY = y;
+  }
+
+  public setBasemapEnabled(enabled: boolean) {
+    this.basemapEnabled = enabled;
+  }
+
+  public setTileProvider(provider: TileProvider) {
+    this.tileCache.setProvider(provider);
+    // Clear existing textures
+    this.tileTextures.forEach(tex => tex.destroy());
+    this.tileTextures.clear();
   }
 
   public setStatsCallback(cb: (stats: { fps: number }) => void) {
@@ -191,6 +275,30 @@ export class WebGPURenderer {
 
   private async initPipelines() {
     if (!this.device) return;
+
+    // Tile Pipeline
+    const tileModule = this.device.createShaderModule({ code: TILE_SHADER });
+    this.tilePipeline = this.device.createRenderPipeline({
+      layout: 'auto',
+      vertex: {
+        module: tileModule,
+        entryPoint: 'vs_main',
+      },
+      fragment: {
+        module: tileModule,
+        entryPoint: 'fs_main',
+        targets: [{ format: this.format }],
+      },
+      primitive: { topology: 'triangle-list' },
+    });
+
+    // Tile sampler
+    this.tileSampler = this.device.createSampler({
+      magFilter: 'linear',
+      minFilter: 'linear',
+      addressModeU: 'clamp-to-edge',
+      addressModeV: 'clamp-to-edge',
+    });
 
     // Node Pipeline
     const nodeModule = this.device.createShaderModule({ code: NODE_SHADER });
@@ -282,6 +390,12 @@ export class WebGPURenderer {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
+    // Tile uniform buffer: 4 floats (minX, minY, maxX, maxY) = 16 bytes
+    this.tileUniformBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
     // Create bind groups
     if (this.nodePipeline && this.edgePipeline) {
       this.nodeBindGroup = this.device.createBindGroup({
@@ -335,6 +449,42 @@ export class WebGPURenderer {
     this.device.queue.writeBuffer(this.uniformBuffer, 0, data);
   }
 
+  private tileKey(tile: TileCoord): string {
+    return `${tile.z}/${tile.x}/${tile.y}`;
+  }
+
+  private getOrCreateTileTexture(tile: TileCoord): GPUTexture | null {
+    if (!this.device) return null;
+
+    const key = this.tileKey(tile);
+    if (this.tileTextures.has(key)) {
+      return this.tileTextures.get(key)!;
+    }
+
+    const img = this.tileCache.getImmediate(tile);
+    if (!img) {
+      // Start loading in background
+      this.tileCache.getTile(tile);
+      return null;
+    }
+
+    // Create texture from image
+    const texture = this.device.createTexture({
+      size: [img.width, img.height, 1],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+
+    this.device.queue.copyExternalImageToTexture(
+      { source: img },
+      { texture },
+      [img.width, img.height]
+    );
+
+    this.tileTextures.set(key, texture);
+    return texture;
+  }
+
   public render = () => {
     if (!this.device || !this.context || !this.nodePipeline || !this.edgePipeline) {
       this.frameId = requestAnimationFrame(this.render);
@@ -365,7 +515,12 @@ export class WebGPURenderer {
       }],
     });
 
-    // Draw edges first (behind nodes)
+    // Draw tiles (basemap) first
+    if (this.basemapEnabled && this.tilePipeline && this.tileSampler && this.tileUniformBuffer) {
+      this.renderTiles(renderPass);
+    }
+
+    // Draw edges (behind nodes)
     if (this.edgeBindGroup && this.graphState.edgeCount > 0) {
       renderPass.setPipeline(this.edgePipeline);
       renderPass.setBindGroup(0, this.edgeBindGroup);
@@ -384,6 +539,59 @@ export class WebGPURenderer {
 
     this.frameId = requestAnimationFrame(this.render);
   };
+
+  private renderTiles(renderPass: GPURenderPassEncoder) {
+    if (!this.device || !this.tilePipeline || !this.tileSampler || !this.uniformBuffer || !this.tileUniformBuffer) return;
+
+    // Calculate absolute camera position
+    const absCenterX = this.worldCenterX + this.camera.centerX;
+    const absCenterY = this.worldCenterY + this.camera.centerY;
+
+    // Get visible tiles
+    const tiles = getVisibleTiles(
+      absCenterX,
+      absCenterY,
+      this.canvas.width,
+      this.canvas.height,
+      this.camera.zoom
+    );
+
+    renderPass.setPipeline(this.tilePipeline);
+
+    for (const tile of tiles) {
+      const texture = this.getOrCreateTileTexture(tile);
+      if (!texture) continue; // Skip tiles that aren't loaded yet
+
+      // Get tile bounds in absolute Web Mercator
+      const bounds = tileBounds(tile);
+
+      // Convert to local coordinates (relative to world center)
+      const localBounds = {
+        minX: bounds.minX - this.worldCenterX,
+        minY: bounds.minY - this.worldCenterY,
+        maxX: bounds.maxX - this.worldCenterX,
+        maxY: bounds.maxY - this.worldCenterY,
+      };
+
+      // Update tile uniform buffer
+      const tileData = new Float32Array([localBounds.minX, localBounds.minY, localBounds.maxX, localBounds.maxY]);
+      this.device.queue.writeBuffer(this.tileUniformBuffer, 0, tileData);
+
+      // Create bind group for this tile
+      const tileBindGroup = this.device.createBindGroup({
+        layout: this.tilePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.uniformBuffer } },
+          { binding: 1, resource: this.tileSampler },
+          { binding: 2, resource: texture.createView() },
+          { binding: 3, resource: { buffer: this.tileUniformBuffer } },
+        ],
+      });
+
+      renderPass.setBindGroup(0, tileBindGroup);
+      renderPass.draw(6);
+    }
+  }
 
   public setCamera(centerX: number, centerY: number, zoom: number) {
     this.camera.centerX = centerX;

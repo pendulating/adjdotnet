@@ -74,6 +74,36 @@ html, body, #app {
   color: #60a5fa;
 }
 
+.basemap-selector {
+  display: flex;
+  gap: 0.25rem;
+  margin-top: 0.5rem;
+  pointer-events: auto;
+}
+
+.basemap-selector button {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  padding: 0.35rem 0.6rem;
+  background: rgba(24, 24, 27, 0.8);
+  border: 1px solid #27272a;
+  color: #71717a;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.basemap-selector button:hover {
+  background: rgba(39, 39, 42, 0.9);
+  color: #a1a1aa;
+}
+
+.basemap-selector button.active {
+  background: rgba(59, 130, 246, 0.15);
+  border-color: #3b82f6;
+  color: #60a5fa;
+}
+
 .stats {
   position: absolute;
   bottom: 1.5rem;
