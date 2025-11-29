@@ -32,27 +32,78 @@ html, body, #app {
   font-weight: 600;
   color: #e4e4e7;
   letter-spacing: -0.025em;
-  margin-bottom: 0.5rem;
+  margin-bottom: 0.75rem;
   text-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
 }
 
-.overlay p {
+/* ==================== TOOLBAR ==================== */
+
+.toolbar {
+  display: flex;
+  gap: 0.25rem;
+  margin-bottom: 0.75rem;
+  pointer-events: auto;
+  background: rgba(10, 10, 15, 0.9);
+  padding: 0.375rem;
+  border-radius: 8px;
+  border: 1px solid #27272a;
+  backdrop-filter: blur(12px);
+  width: fit-content;
+}
+
+.toolbar button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.125rem;
   font-family: 'JetBrains Mono', monospace;
-  font-size: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  background: transparent;
+  border: 1px solid transparent;
+  color: #71717a;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  min-width: 56px;
+}
+
+.toolbar button .icon {
+  font-size: 1.125rem;
+  line-height: 1;
+}
+
+.toolbar button .label {
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.toolbar button:hover {
+  background: rgba(39, 39, 42, 0.7);
   color: #a1a1aa;
 }
 
+.toolbar button.active {
+  background: rgba(59, 130, 246, 0.2);
+  border-color: #3b82f6;
+  color: #60a5fa;
+}
+
+/* ==================== CONTROLS ==================== */
+
 .controls {
   display: flex;
+  align-items: center;
   gap: 0.5rem;
-  margin-top: 1rem;
+  margin-bottom: 0.5rem;
   pointer-events: auto;
+  flex-wrap: wrap;
 }
 
 .controls button {
   font-family: 'JetBrains Mono', monospace;
-  font-size: 0.75rem;
-  padding: 0.5rem 1rem;
+  font-size: 0.7rem;
+  padding: 0.5rem 0.875rem;
   background: rgba(24, 24, 27, 0.9);
   border: 1px solid #27272a;
   color: #a1a1aa;
@@ -60,9 +111,12 @@ html, body, #app {
   cursor: pointer;
   transition: all 0.15s ease;
   backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
 }
 
-.controls button:hover {
+.controls button:hover:not(:disabled) {
   background: rgba(39, 39, 42, 0.9);
   border-color: #3f3f46;
   color: #e4e4e7;
@@ -74,10 +128,23 @@ html, body, #app {
   color: #60a5fa;
 }
 
+.controls button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.controls .separator {
+  width: 1px;
+  height: 24px;
+  background: #27272a;
+  margin: 0 0.25rem;
+}
+
+/* ==================== BASEMAP SELECTOR ==================== */
+
 .basemap-selector {
   display: flex;
   gap: 0.25rem;
-  margin-top: 0.5rem;
   pointer-events: auto;
 }
 
@@ -104,6 +171,8 @@ html, body, #app {
   color: #60a5fa;
 }
 
+/* ==================== STATS ==================== */
+
 .stats {
   position: absolute;
   bottom: 1.5rem;
@@ -112,18 +181,41 @@ html, body, #app {
   font-size: 0.7rem;
   color: #52525b;
   pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
 }
 
 .stats span {
   display: block;
-  line-height: 1.6;
+  line-height: 1.4;
 }
+
+.stats .selection-info {
+  color: #f59e0b;
+  font-weight: 500;
+}
+
+.stats .mode-hint {
+  color: #22c55e;
+  font-weight: 500;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+/* ==================== CANVAS ==================== */
 
 canvas {
   display: block;
   width: 100%;
   height: 100%;
 }
+
+/* ==================== LOADING ==================== */
 
 .loading-overlay {
   position: absolute;
@@ -141,7 +233,7 @@ canvas {
   font-size: 1rem;
   font-weight: 500;
   color: #e4e4e7;
-  margin-bottom: 1rem;
+  margin-top: 1rem;
 }
 
 .loading-spinner {
@@ -156,6 +248,8 @@ canvas {
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
+
+/* ==================== ERROR ==================== */
 
 .error-overlay {
   position: absolute;
@@ -186,3 +280,25 @@ canvas {
   line-height: 1.6;
 }
 
+/* ==================== KEYBOARD HINTS (BOTTOM RIGHT) ==================== */
+
+.keyboard-hints {
+  position: absolute;
+  bottom: 1.5rem;
+  right: 1.5rem;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  color: #3f3f46;
+  text-align: right;
+  pointer-events: none;
+}
+
+.keyboard-hints kbd {
+  display: inline-block;
+  padding: 0.15rem 0.4rem;
+  background: rgba(39, 39, 42, 0.5);
+  border: 1px solid #27272a;
+  border-radius: 3px;
+  font-family: inherit;
+  margin-left: 0.25rem;
+}

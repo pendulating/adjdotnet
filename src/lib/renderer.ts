@@ -2,6 +2,7 @@ import { GraphState } from './graph-state';
 import { mat4 } from 'wgpu-matrix';
 import { TileCache, tileBounds, getVisibleTiles, TILE_PROVIDERS } from './tile-layer';
 import type { TileCoord, TileProvider } from './tile-layer';
+import type { Selection } from './editor-state';
 
 const TILE_SHADER = `
 struct Camera {
@@ -17,9 +18,9 @@ struct Camera {
 @group(0) @binding(2) var tileTexture: texture_2d<f32>;
 
 struct VertexInput {
-  @location(0) corner: vec2f,      // 0-1 normalized corner position
-  @location(1) tileBoundsMin: vec2f, // minX, minY
-  @location(2) tileBoundsMax: vec2f, // maxX, maxY
+  @location(0) corner: vec2f,
+  @location(1) tileBoundsMin: vec2f,
+  @location(2) tileBoundsMax: vec2f,
 };
 
 struct VertexOutput {
@@ -34,7 +35,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
   
   var out: VertexOutput;
   out.position = camera.projection * camera.view * vec4f(worldX, worldY, 0.0, 1.0);
-  out.uv = vec2f(input.corner.x, 1.0 - input.corner.y); // Flip Y for texture
+  out.uv = vec2f(input.corner.x, 1.0 - input.corner.y);
   return out;
 }
 
@@ -61,10 +62,12 @@ struct Node {
 };
 
 @group(0) @binding(1) var<storage, read> nodes: array<Node>;
+@group(0) @binding(2) var<storage, read> selectionMask: array<u32>;
 
 struct VertexOutput {
   @builtin(position) position: vec4f,
   @location(0) uv: vec2f,
+  @location(1) @interpolate(flat) selected: u32,
 };
 
 @vertex
@@ -74,7 +77,11 @@ fn vs_main(
 ) -> VertexOutput {
   let node = nodes[iIdx];
   
-  // Quad vertices (2 triangles)
+  // Check if this node is selected (bit-packed, 32 nodes per u32)
+  let wordIdx = iIdx / 32u;
+  let bitIdx = iIdx % 32u;
+  let isSelected = (selectionMask[wordIdx] >> bitIdx) & 1u;
+  
   var quadPos: array<vec2f, 6> = array<vec2f, 6>(
     vec2f(-1.0, -1.0),
     vec2f( 1.0, -1.0),
@@ -94,25 +101,34 @@ fn vs_main(
   );
   
   let localPos = quadPos[vIdx];
-  let nodeSize = 8.0 / camera.scale; // 8 pixels in screen space
+  var nodeSize = 8.0 / camera.scale;
+  // Make selected nodes slightly larger
+  if (isSelected == 1u) {
+    nodeSize = 12.0 / camera.scale;
+  }
   
   let worldPos = vec4f(node.pos + localPos * nodeSize, 0.0, 1.0);
   
   var out: VertexOutput;
   out.position = camera.projection * camera.view * worldPos;
   out.uv = quadUV[vIdx];
+  out.selected = isSelected;
   return out;
 }
 
 @fragment
-fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
+fn fs_main(@location(0) uv: vec2f, @location(1) @interpolate(flat) selected: u32) -> @location(0) vec4f {
   let d = distance(uv, vec2f(0.5));
   if (d > 0.5) {
     discard;
   }
-  // Soft edge
   let alpha = smoothstep(0.5, 0.35, d);
-  return vec4f(0.24, 0.63, 0.95, alpha); // Blue nodes
+  
+  // Selected nodes are orange, normal nodes are blue
+  if (selected == 1u) {
+    return vec4f(1.0, 0.6, 0.2, alpha); // Orange
+  }
+  return vec4f(0.24, 0.63, 0.95, alpha); // Blue
 }
 `;
 
@@ -140,23 +156,72 @@ struct Edge {
 };
 
 @group(0) @binding(2) var<storage, read> edges: array<Edge>;
+@group(0) @binding(3) var<storage, read> edgeSelectionMask: array<u32>;
+
+struct VertexOutput {
+  @builtin(position) position: vec4f,
+  @location(0) @interpolate(flat) selected: u32,
+};
 
 @vertex
-fn vs_main(@builtin(vertex_index) vIdx: u32) -> @builtin(position) vec4f {
+fn vs_main(@builtin(vertex_index) vIdx: u32) -> VertexOutput {
   let edgeIdx = vIdx / 2u;
   let isDest = (vIdx % 2u) == 1u;
+  
+  // Check if this edge is selected
+  let wordIdx = edgeIdx / 32u;
+  let bitIdx = edgeIdx % 32u;
+  let isSelected = (edgeSelectionMask[wordIdx] >> bitIdx) & 1u;
   
   let edge = edges[edgeIdx];
   let nodeIdx = select(edge.source, edge.dest, isDest);
   let node = nodes[nodeIdx];
   
   let worldPos = vec4f(node.pos, 0.0, 1.0);
-  return camera.projection * camera.view * worldPos;
+  
+  var out: VertexOutput;
+  out.position = camera.projection * camera.view * worldPos;
+  out.selected = isSelected;
+  return out;
+}
+
+@fragment
+fn fs_main(@location(0) @interpolate(flat) selected: u32) -> @location(0) vec4f {
+  if (selected == 1u) {
+    return vec4f(1.0, 0.6, 0.2, 0.9); // Orange selected
+  }
+  return vec4f(0.4, 0.4, 0.45, 0.6); // Gray normal
+}
+`;
+
+// Preview edge shader (for edge creation mode)
+const PREVIEW_EDGE_SHADER = `
+struct Camera {
+  projection: mat4x4f,
+  view: mat4x4f,
+  viewport: vec2f,
+  scale: f32,
+  _pad: f32,
+};
+
+@group(0) @binding(0) var<uniform> camera: Camera;
+
+struct PreviewEdge {
+  start: vec2f,
+  end: vec2f,
+};
+
+@group(0) @binding(1) var<uniform> previewEdge: PreviewEdge;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vIdx: u32) -> @builtin(position) vec4f {
+  let pos = select(previewEdge.start, previewEdge.end, vIdx == 1u);
+  return camera.projection * camera.view * vec4f(pos, 0.0, 1.0);
 }
 
 @fragment
 fn fs_main() -> @location(0) vec4f {
-  return vec4f(0.4, 0.4, 0.45, 0.6); // Gray edges
+  return vec4f(0.2, 0.9, 0.4, 0.8); // Green preview
 }
 `;
 
@@ -173,29 +238,43 @@ export class WebGPURenderer {
   private format: GPUTextureFormat = 'bgra8unorm';
 
   private graphState: GraphState;
+  private lastGraphVersion: number = -1;
 
   // Pipelines
   private nodePipeline: GPURenderPipeline | null = null;
   private edgePipeline: GPURenderPipeline | null = null;
   private tilePipeline: GPURenderPipeline | null = null;
+  private previewEdgePipeline: GPURenderPipeline | null = null;
 
   // Buffers
   private nodeBuffer: GPUBuffer | null = null;
   private edgeBuffer: GPUBuffer | null = null;
   private uniformBuffer: GPUBuffer | null = null;
-  private tileVertexBuffer: GPUBuffer | null = null;
+  private nodeSelectionBuffer: GPUBuffer | null = null;
+  private edgeSelectionBuffer: GPUBuffer | null = null;
+  private previewEdgeBuffer: GPUBuffer | null = null;
   private tileBindGroupLayout: GPUBindGroupLayout | null = null;
 
   // Bind Groups
   private nodeBindGroup: GPUBindGroup | null = null;
   private edgeBindGroup: GPUBindGroup | null = null;
+  private previewEdgeBindGroup: GPUBindGroup | null = null;
+
+  // Selection state (bit-packed)
+  private nodeSelectionMask: Uint32Array = new Uint32Array(0);
+  private edgeSelectionMask: Uint32Array = new Uint32Array(0);
+
+  // Preview edge (for addEdge mode)
+  private previewEdgeVisible = false;
+  private previewEdgeStart = { x: 0, y: 0 };
+  private previewEdgeEnd = { x: 0, y: 0 };
 
   // Tile Layer
   private tileCache: TileCache;
   private tileTextures = new Map<string, GPUTexture>();
   private tileSampler: GPUSampler | null = null;
   private basemapEnabled = true;
-  private worldCenterX = 0; // Absolute Web Mercator center
+  private worldCenterX = 0;
   private worldCenterY = 0;
 
   // Camera
@@ -225,7 +304,6 @@ export class WebGPURenderer {
 
   public setTileProvider(provider: TileProvider) {
     this.tileCache.setProvider(provider);
-    // Clear existing textures
     this.tileTextures.forEach(tex => tex.destroy());
     this.tileTextures.clear();
   }
@@ -272,7 +350,7 @@ export class WebGPURenderer {
       ],
     });
 
-    // Tile Pipeline with vertex buffers
+    // Tile Pipeline
     const tileModule = this.device.createShaderModule({ code: TILE_SHADER });
     this.tilePipeline = this.device.createRenderPipeline({
       layout: this.device.createPipelineLayout({
@@ -282,11 +360,11 @@ export class WebGPURenderer {
         module: tileModule,
         entryPoint: 'vs_main',
         buffers: [{
-          arrayStride: 24, // 6 floats: corner(2) + boundsMin(2) + boundsMax(2)
+          arrayStride: 24,
           attributes: [
-            { shaderLocation: 0, offset: 0, format: 'float32x2' },  // corner
-            { shaderLocation: 1, offset: 8, format: 'float32x2' },  // tileBoundsMin
-            { shaderLocation: 2, offset: 16, format: 'float32x2' }, // tileBoundsMax
+            { shaderLocation: 0, offset: 0, format: 'float32x2' },
+            { shaderLocation: 1, offset: 8, format: 'float32x2' },
+            { shaderLocation: 2, offset: 16, format: 'float32x2' },
           ],
         }],
       },
@@ -298,7 +376,6 @@ export class WebGPURenderer {
       primitive: { topology: 'triangle-list' },
     });
 
-    // Tile sampler
     this.tileSampler = this.device.createSampler({
       magFilter: 'linear',
       minFilter: 'linear',
@@ -349,17 +426,47 @@ export class WebGPURenderer {
       },
       primitive: { topology: 'line-list' },
     });
+
+    // Preview Edge Pipeline
+    const previewModule = this.device.createShaderModule({ code: PREVIEW_EDGE_SHADER });
+    this.previewEdgePipeline = this.device.createRenderPipeline({
+      layout: 'auto',
+      vertex: {
+        module: previewModule,
+        entryPoint: 'vs_main',
+      },
+      fragment: {
+        module: previewModule,
+        entryPoint: 'fs_main',
+        targets: [{
+          format: this.format,
+          blend: {
+            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          },
+        }],
+      },
+      primitive: { topology: 'line-list' },
+    });
   }
 
   private async initBuffers() {
     if (!this.device) return;
+    this.syncBuffers();
+  }
+
+  /**
+   * Re-upload graph data to GPU buffers after mutations
+   */
+  public syncBuffers() {
+    if (!this.device || !this.nodePipeline || !this.edgePipeline || !this.previewEdgePipeline) return;
 
     const { nodeX, nodeY, edgeSource, edgeTarget } = this.graphState.getBuffers();
     const nodeCount = this.graphState.nodeCount;
     const edgeCount = this.graphState.edgeCount;
 
     // Node buffer: vec2f pos + vec2f vel = 16 bytes per node
-    const nodeData = new Float32Array(nodeCount * 4);
+    const nodeData = new Float32Array(Math.max(nodeCount, 1) * 4);
     for (let i = 0; i < nodeCount; i++) {
       nodeData[i * 4 + 0] = nodeX[i];
       nodeData[i * 4 + 1] = nodeY[i];
@@ -367,6 +474,8 @@ export class WebGPURenderer {
       nodeData[i * 4 + 3] = 0;
     }
 
+    // Recreate node buffer
+    this.nodeBuffer?.destroy();
     this.nodeBuffer = this.device.createBuffer({
       size: Math.max(nodeData.byteLength, 16),
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
@@ -376,12 +485,13 @@ export class WebGPURenderer {
     this.nodeBuffer.unmap();
 
     // Edge buffer: u32 source + u32 target = 8 bytes per edge
-    const edgeData = new Uint32Array(edgeCount * 2);
+    const edgeData = new Uint32Array(Math.max(edgeCount, 1) * 2);
     for (let i = 0; i < edgeCount; i++) {
       edgeData[i * 2 + 0] = edgeSource[i];
       edgeData[i * 2 + 1] = edgeTarget[i];
     }
 
+    this.edgeBuffer?.destroy();
     this.edgeBuffer = this.device.createBuffer({
       size: Math.max(edgeData.byteLength, 8),
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
@@ -390,30 +500,109 @@ export class WebGPURenderer {
     new Uint32Array(this.edgeBuffer.getMappedRange()).set(edgeData);
     this.edgeBuffer.unmap();
 
-    // Uniform buffer: mat4x4 projection (64) + mat4x4 view (64) + vec2 viewport (8) + float scale (4) + pad (4) = 144 bytes
-    this.uniformBuffer = this.device.createBuffer({
-      size: 144,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    // Selection buffers (bit-packed, 32 elements per u32)
+    const nodeSelectionWords = Math.ceil(Math.max(nodeCount, 1) / 32);
+    const edgeSelectionWords = Math.ceil(Math.max(edgeCount, 1) / 32);
+
+    this.nodeSelectionMask = new Uint32Array(nodeSelectionWords);
+    this.edgeSelectionMask = new Uint32Array(edgeSelectionWords);
+
+    this.nodeSelectionBuffer?.destroy();
+    this.nodeSelectionBuffer = this.device.createBuffer({
+      size: Math.max(nodeSelectionWords * 4, 4),
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
 
-    // Create bind groups
-    if (this.nodePipeline && this.edgePipeline) {
-      this.nodeBindGroup = this.device.createBindGroup({
-        layout: this.nodePipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: { buffer: this.uniformBuffer } },
-          { binding: 1, resource: { buffer: this.nodeBuffer } },
-        ],
-      });
+    this.edgeSelectionBuffer?.destroy();
+    this.edgeSelectionBuffer = this.device.createBuffer({
+      size: Math.max(edgeSelectionWords * 4, 4),
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
 
-      this.edgeBindGroup = this.device.createBindGroup({
-        layout: this.edgePipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: { buffer: this.uniformBuffer } },
-          { binding: 1, resource: { buffer: this.nodeBuffer } },
-          { binding: 2, resource: { buffer: this.edgeBuffer } },
-        ],
+    // Uniform buffer
+    if (!this.uniformBuffer) {
+      this.uniformBuffer = this.device.createBuffer({
+        size: 144,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
+    }
+
+    // Preview edge buffer (2 vec2f = 16 bytes)
+    if (!this.previewEdgeBuffer) {
+      this.previewEdgeBuffer = this.device.createBuffer({
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+
+    // Recreate bind groups
+    this.nodeBindGroup = this.device.createBindGroup({
+      layout: this.nodePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.uniformBuffer } },
+        { binding: 1, resource: { buffer: this.nodeBuffer } },
+        { binding: 2, resource: { buffer: this.nodeSelectionBuffer } },
+      ],
+    });
+
+    this.edgeBindGroup = this.device.createBindGroup({
+      layout: this.edgePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.uniformBuffer } },
+        { binding: 1, resource: { buffer: this.nodeBuffer } },
+        { binding: 2, resource: { buffer: this.edgeBuffer } },
+        { binding: 3, resource: { buffer: this.edgeSelectionBuffer } },
+      ],
+    });
+
+    this.previewEdgeBindGroup = this.device.createBindGroup({
+      layout: this.previewEdgePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.uniformBuffer } },
+        { binding: 1, resource: { buffer: this.previewEdgeBuffer } },
+      ],
+    });
+
+    this.lastGraphVersion = this.graphState.version;
+  }
+
+  /**
+   * Update selection highlighting
+   */
+  public setSelection(selection: Selection) {
+    if (!this.device || !this.nodeSelectionBuffer || !this.edgeSelectionBuffer) return;
+
+    // Clear and rebuild node selection mask
+    this.nodeSelectionMask.fill(0);
+    for (const nodeIdx of selection.nodes) {
+      const wordIdx = Math.floor(nodeIdx / 32);
+      const bitIdx = nodeIdx % 32;
+      if (wordIdx < this.nodeSelectionMask.length) {
+        this.nodeSelectionMask[wordIdx] |= (1 << bitIdx);
+      }
+    }
+    this.device.queue.writeBuffer(this.nodeSelectionBuffer, 0, this.nodeSelectionMask);
+
+    // Clear and rebuild edge selection mask
+    this.edgeSelectionMask.fill(0);
+    for (const edgeIdx of selection.edges) {
+      const wordIdx = Math.floor(edgeIdx / 32);
+      const bitIdx = edgeIdx % 32;
+      if (wordIdx < this.edgeSelectionMask.length) {
+        this.edgeSelectionMask[wordIdx] |= (1 << bitIdx);
+      }
+    }
+    this.device.queue.writeBuffer(this.edgeSelectionBuffer, 0, this.edgeSelectionMask);
+  }
+
+  /**
+   * Set preview edge (for addEdge mode)
+   */
+  public setPreviewEdge(visible: boolean, startX?: number, startY?: number, endX?: number, endY?: number) {
+    this.previewEdgeVisible = visible;
+    if (visible && startX !== undefined && startY !== undefined && endX !== undefined && endY !== undefined) {
+      this.previewEdgeStart = { x: startX, y: startY };
+      this.previewEdgeEnd = { x: endX, y: endY };
     }
   }
 
@@ -422,9 +611,7 @@ export class WebGPURenderer {
 
     const width = this.canvas.width;
     const height = this.canvas.height;
-    const aspect = width / height;
 
-    // Orthographic projection centered on camera position
     const halfWidth = (width / 2) / this.camera.zoom;
     const halfHeight = (height / 2) / this.camera.zoom;
 
@@ -434,19 +621,26 @@ export class WebGPURenderer {
       -1, 1
     );
 
-    // View matrix (translate to camera center)
     const view = mat4.translation([-this.camera.centerX, -this.camera.centerY, 0]);
 
-    // Write to buffer
-    const data = new Float32Array(36); // 16 + 16 + 2 + 1 + 1 = 36
+    const data = new Float32Array(36);
     data.set(projection, 0);
     data.set(view, 16);
     data[32] = width;
     data[33] = height;
     data[34] = this.camera.zoom;
-    data[35] = 0; // padding
+    data[35] = 0;
 
     this.device.queue.writeBuffer(this.uniformBuffer, 0, data);
+
+    // Update preview edge buffer if visible
+    if (this.previewEdgeVisible && this.previewEdgeBuffer) {
+      const previewData = new Float32Array([
+        this.previewEdgeStart.x, this.previewEdgeStart.y,
+        this.previewEdgeEnd.x, this.previewEdgeEnd.y,
+      ]);
+      this.device.queue.writeBuffer(this.previewEdgeBuffer, 0, previewData);
+    }
   }
 
   private tileKey(tile: TileCoord): string {
@@ -463,12 +657,10 @@ export class WebGPURenderer {
 
     const img = this.tileCache.getImmediate(tile);
     if (!img) {
-      // Start loading in background
       this.tileCache.getTile(tile);
       return null;
     }
 
-    // Create texture from image
     const texture = this.device.createTexture({
       size: [img.width, img.height, 1],
       format: 'rgba8unorm',
@@ -489,6 +681,11 @@ export class WebGPURenderer {
     if (!this.device || !this.context || !this.nodePipeline || !this.edgePipeline) {
       this.frameId = requestAnimationFrame(this.render);
       return;
+    }
+
+    // Auto-sync if graph changed
+    if (this.graphState.version !== this.lastGraphVersion) {
+      this.syncBuffers();
     }
 
     // FPS tracking
@@ -527,11 +724,18 @@ export class WebGPURenderer {
       renderPass.draw(this.graphState.edgeCount * 2);
     }
 
+    // Draw preview edge (if in addEdge mode)
+    if (this.previewEdgeVisible && this.previewEdgeBindGroup && this.previewEdgePipeline) {
+      renderPass.setPipeline(this.previewEdgePipeline);
+      renderPass.setBindGroup(0, this.previewEdgeBindGroup);
+      renderPass.draw(2);
+    }
+
     // Draw nodes
     if (this.nodeBindGroup && this.graphState.nodeCount > 0) {
       renderPass.setPipeline(this.nodePipeline);
       renderPass.setBindGroup(0, this.nodeBindGroup);
-      renderPass.draw(6, this.graphState.nodeCount); // 6 verts per quad, instanced
+      renderPass.draw(6, this.graphState.nodeCount);
     }
 
     renderPass.end();
@@ -543,11 +747,9 @@ export class WebGPURenderer {
   private renderTiles(renderPass: GPURenderPassEncoder) {
     if (!this.device || !this.tilePipeline || !this.tileSampler || !this.uniformBuffer || !this.tileBindGroupLayout) return;
 
-    // Calculate absolute camera position
     const absCenterX = this.worldCenterX + this.camera.centerX;
     const absCenterY = this.worldCenterY + this.camera.centerY;
 
-    // Get visible tiles
     const tiles = getVisibleTiles(
       absCenterX,
       absCenterY,
@@ -558,7 +760,6 @@ export class WebGPURenderer {
 
     renderPass.setPipeline(this.tilePipeline);
 
-    // Quad corners: 6 vertices for 2 triangles
     const corners = [
       [0, 0], [1, 0], [0, 1],
       [0, 1], [1, 0], [1, 1],
@@ -566,30 +767,26 @@ export class WebGPURenderer {
 
     for (const tile of tiles) {
       const texture = this.getOrCreateTileTexture(tile);
-      if (!texture) continue; // Skip tiles that aren't loaded yet
+      if (!texture) continue;
 
-      // Get tile bounds in absolute Web Mercator
       const bounds = tileBounds(tile);
 
-      // Convert to local coordinates (relative to world center)
       const minX = bounds.minX - this.worldCenterX;
       const minY = bounds.minY - this.worldCenterY;
       const maxX = bounds.maxX - this.worldCenterX;
       const maxY = bounds.maxY - this.worldCenterY;
 
-      // Create vertex data for this tile: 6 vertices × 6 floats each
       const vertexData = new Float32Array(36);
       for (let i = 0; i < 6; i++) {
         const offset = i * 6;
-        vertexData[offset + 0] = corners[i][0]; // corner.x
-        vertexData[offset + 1] = corners[i][1]; // corner.y
-        vertexData[offset + 2] = minX;          // boundsMin.x
-        vertexData[offset + 3] = minY;          // boundsMin.y
-        vertexData[offset + 4] = maxX;          // boundsMax.x
-        vertexData[offset + 5] = maxY;          // boundsMax.y
+        vertexData[offset + 0] = corners[i][0];
+        vertexData[offset + 1] = corners[i][1];
+        vertexData[offset + 2] = minX;
+        vertexData[offset + 3] = minY;
+        vertexData[offset + 4] = maxX;
+        vertexData[offset + 5] = maxY;
       }
 
-      // Create vertex buffer for this tile
       const vertexBuffer = this.device.createBuffer({
         size: vertexData.byteLength,
         usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
@@ -598,7 +795,6 @@ export class WebGPURenderer {
       new Float32Array(vertexBuffer.getMappedRange()).set(vertexData);
       vertexBuffer.unmap();
 
-      // Create bind group for this tile
       const tileBindGroup = this.device.createBindGroup({
         layout: this.tileBindGroupLayout,
         entries: [
@@ -614,6 +810,28 @@ export class WebGPURenderer {
     }
   }
 
+  // ==================== COORDINATE CONVERSION ====================
+
+  /**
+   * Convert screen coordinates to world coordinates
+   */
+  public screenToWorld(screenX: number, screenY: number): { x: number; y: number } {
+    const x = this.camera.centerX + (screenX - this.canvas.width / 2) / this.camera.zoom;
+    const y = this.camera.centerY - (screenY - this.canvas.height / 2) / this.camera.zoom;
+    return { x, y };
+  }
+
+  /**
+   * Convert world coordinates to screen coordinates
+   */
+  public worldToScreen(worldX: number, worldY: number): { x: number; y: number } {
+    const x = (worldX - this.camera.centerX) * this.camera.zoom + this.canvas.width / 2;
+    const y = (this.camera.centerY - worldY) * this.camera.zoom + this.canvas.height / 2;
+    return { x, y };
+  }
+
+  // ==================== CAMERA CONTROLS ====================
+
   public setCamera(centerX: number, centerY: number, zoom: number) {
     this.camera.centerX = centerX;
     this.camera.centerY = centerY;
@@ -626,13 +844,11 @@ export class WebGPURenderer {
   }
 
   public zoomAt(x: number, y: number, factor: number) {
-    // Convert screen coords to world coords before zoom
     const worldX = this.camera.centerX + (x - this.canvas.width / 2) / this.camera.zoom;
     const worldY = this.camera.centerY - (y - this.canvas.height / 2) / this.camera.zoom;
 
     const newZoom = Math.max(0.001, Math.min(100, this.camera.zoom * factor));
     
-    // Adjust center to zoom toward mouse position
     this.camera.centerX = worldX - (x - this.canvas.width / 2) / newZoom;
     this.camera.centerY = worldY + (y - this.canvas.height / 2) / newZoom;
     this.camera.zoom = newZoom;
@@ -640,5 +856,12 @@ export class WebGPURenderer {
 
   public destroy() {
     cancelAnimationFrame(this.frameId);
+    this.nodeBuffer?.destroy();
+    this.edgeBuffer?.destroy();
+    this.uniformBuffer?.destroy();
+    this.nodeSelectionBuffer?.destroy();
+    this.edgeSelectionBuffer?.destroy();
+    this.previewEdgeBuffer?.destroy();
+    this.tileTextures.forEach(tex => tex.destroy());
   }
 }

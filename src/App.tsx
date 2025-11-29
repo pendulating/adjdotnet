@@ -4,6 +4,19 @@ import { WebGPURenderer } from './lib/renderer';
 import { GraphState } from './lib/graph-state';
 import { DuckDBLayer } from './lib/duckdb';
 import { TILE_PROVIDERS } from './lib/tile-layer';
+import type { EditorMode, Selection } from './lib/editor-state';
+import {
+  EDITOR_MODES,
+  createEmptySelection,
+  toggleNodeSelection,
+  toggleEdgeSelection,
+  selectionCount,
+  CommandHistory,
+  AddNodeCommand,
+  AddEdgeCommand,
+  MoveNodeCommand,
+  BatchDeleteCommand,
+} from './lib/editor-state';
 
 interface NetworkMetadata {
   center_x: number;
@@ -18,31 +31,45 @@ const BASEMAP_OPTIONS = [
   { id: 'osm', label: 'OpenStreetMap' },
 ] as const;
 
+// Hit detection threshold in pixels
+const HIT_THRESHOLD_PX = 12;
+
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<WebGPURenderer | null>(null);
+  const graphRef = useRef<GraphState | null>(null);
+  const commandHistoryRef = useRef<CommandHistory>(new CommandHistory());
+
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [stats, setStats] = useState({ nodes: 0, edges: 0, fps: 0 });
   const [basemapEnabled, setBasemapEnabled] = useState(true);
   const [basemapStyle, setBasemapStyle] = useState<string>('cartoDark');
 
-  // Pan/zoom state
-  const isDragging = useRef(false);
-  const lastMouse = useRef({ x: 0, y: 0 });
+  // Editor state
+  const [mode, setMode] = useState<EditorMode>('select');
+  const [selection, setSelection] = useState<Selection>(createEmptySelection());
+  const [pendingEdgeSource, setPendingEdgeSource] = useState<number | null>(null);
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
 
+  // Drag state
+  const isDragging = useRef(false);
+  const dragStartScreen = useRef({ x: 0, y: 0 });
+  const dragStartWorld = useRef({ x: 0, y: 0 });
+  const draggedNodes = useRef<Map<number, { startX: number; startY: number }>>(new Map());
+
+  // Initialize
   useEffect(() => {
     let cancelled = false;
     
     async function init() {
       try {
-        // Load metadata first
         const metaRes = await fetch('/data/network_metadata.json');
         const metadata: NetworkMetadata = await metaRes.json();
 
         if (cancelled) return;
 
-        // Init DuckDB
         const db = DuckDBLayer.getInstance();
         await db.init();
         
@@ -53,33 +80,29 @@ function App() {
 
         if (cancelled) return;
 
-        // Load data to GraphState
         const graph = new GraphState();
         const nodesResult = await db.query('SELECT * FROM nodes');
         const edgesResult = await db.query('SELECT * FROM edges');
         
         graph.loadFromArrow(nodesResult, edgesResult);
+        graphRef.current = graph;
 
         if (cancelled) return;
 
         setStats(s => ({ ...s, nodes: graph.nodeCount, edges: graph.edgeCount }));
 
-        // Wait for canvas to be ready
         const canvas = canvasRef.current;
         if (!canvas) {
           console.error('Canvas not ready');
           return;
         }
         
-        // Set canvas size to match display
         const dpr = window.devicePixelRatio || 1;
         const rect = canvas.getBoundingClientRect();
         canvas.width = rect.width * dpr;
         canvas.height = rect.height * dpr;
 
         const renderer = new WebGPURenderer(canvas, graph);
-        
-        // Set world center for tile coordinate conversion
         renderer.setWorldCenter(metadata.center_x, metadata.center_y);
         
         await renderer.init();
@@ -89,8 +112,6 @@ function App() {
           return;
         }
 
-        // Center camera on data (node positions are offsets from center, so center at origin)
-        // Initial zoom based on typical sidewalk network extent (~2km)
         renderer.setCamera(0, 0, 0.1);
 
         renderer.setStatsCallback(({ fps }) => {
@@ -117,6 +138,24 @@ function App() {
     };
   }, []);
 
+  // Update stats when graph changes
+  const updateStats = useCallback(() => {
+    if (graphRef.current) {
+      setStats(s => ({
+        ...s,
+        nodes: graphRef.current!.nodeCount,
+        edges: graphRef.current!.edgeCount,
+      }));
+    }
+    setCanUndo(commandHistoryRef.current.canUndo());
+    setCanRedo(commandHistoryRef.current.canRedo());
+  }, []);
+
+  // Sync selection to renderer
+  useEffect(() => {
+    rendererRef.current?.setSelection(selection);
+  }, [selection]);
+
   // Handle resize
   useEffect(() => {
     const handleResize = () => {
@@ -131,26 +170,261 @@ function App() {
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  // Mouse handlers for pan/zoom
-  const handleMouseDown = useCallback((e: React.MouseEvent) => {
-    isDragging.current = true;
-    lastMouse.current = { x: e.clientX, y: e.clientY };
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Don't handle if focused on input
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+
+      // Mode shortcuts
+      if (!e.ctrlKey && !e.metaKey) {
+        switch (e.key.toLowerCase()) {
+          case 'v': setMode('pan'); return;
+          case 's': setMode('select'); return;
+          case 'n': setMode('addNode'); return;
+          case 'e': setMode('addEdge'); setPendingEdgeSource(null); return;
+          case 'x': setMode('delete'); return;
+          case 'escape':
+            setSelection(createEmptySelection());
+            setPendingEdgeSource(null);
+            rendererRef.current?.setPreviewEdge(false);
+            return;
+          case 'delete':
+          case 'backspace':
+            deleteSelection();
+            return;
+        }
+      }
+
+      // Undo/Redo
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) {
+          redo();
+        } else {
+          undo();
+        }
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key === 'y') {
+        e.preventDefault();
+        redo();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selection]);
+
+  // Hit testing
+  const hitTest = useCallback((screenX: number, screenY: number): { type: 'node' | 'edge' | 'none'; idx: number } => {
+    const renderer = rendererRef.current;
+    const graph = graphRef.current;
+    if (!renderer || !graph) return { type: 'none', idx: -1 };
+
+    const world = renderer.screenToWorld(screenX, screenY);
+    const hitRadiusWorld = HIT_THRESHOLD_PX / renderer.camera.zoom;
+
+    // Check nodes first (they're on top)
+    const nearestNode = graph.findNearestNode(world.x, world.y, hitRadiusWorld);
+    if (nearestNode >= 0) {
+      return { type: 'node', idx: nearestNode };
+    }
+
+    // Then check edges
+    const nearestEdge = graph.findNearestEdge(world.x, world.y, hitRadiusWorld);
+    if (nearestEdge >= 0) {
+      return { type: 'edge', idx: nearestEdge };
+    }
+
+    return { type: 'none', idx: -1 };
   }, []);
+
+  // Mouse handlers
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    const renderer = rendererRef.current;
+    const graph = graphRef.current;
+    if (!renderer || !graph) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    const screenX = (e.clientX - rect.left) * dpr;
+    const screenY = (e.clientY - rect.top) * dpr;
+    const world = renderer.screenToWorld(screenX, screenY);
+
+    dragStartScreen.current = { x: e.clientX, y: e.clientY };
+    dragStartWorld.current = world;
+
+    switch (mode) {
+      case 'pan':
+        isDragging.current = true;
+        break;
+
+      case 'select': {
+        const hit = hitTest(screenX, screenY);
+        if (hit.type === 'node') {
+          const newSelection = toggleNodeSelection(selection, hit.idx, e.shiftKey);
+          setSelection(newSelection);
+
+          // Start drag if clicking on a selected node
+          if (newSelection.nodes.has(hit.idx)) {
+            isDragging.current = true;
+            draggedNodes.current.clear();
+            for (const nodeIdx of newSelection.nodes) {
+              draggedNodes.current.set(nodeIdx, {
+                startX: graph.nodeX[nodeIdx],
+                startY: graph.nodeY[nodeIdx],
+              });
+            }
+          }
+        } else if (hit.type === 'edge') {
+          setSelection(toggleEdgeSelection(selection, hit.idx, e.shiftKey));
+        } else {
+          // Click on empty space - start box selection or clear
+          if (!e.shiftKey) {
+            setSelection(createEmptySelection());
+          }
+          isDragging.current = true;
+        }
+        break;
+      }
+
+      case 'addNode': {
+        const cmd = new AddNodeCommand(graph, world.x, world.y);
+        commandHistoryRef.current.execute(cmd);
+        const newNodeIdx = cmd.getNodeIdx();
+        setSelection({ nodes: new Set([newNodeIdx]), edges: new Set() });
+        updateStats();
+        break;
+      }
+
+      case 'addEdge': {
+        const hit = hitTest(screenX, screenY);
+        if (hit.type === 'node') {
+          if (pendingEdgeSource === null) {
+            // First click - select source
+            setPendingEdgeSource(hit.idx);
+            setSelection({ nodes: new Set([hit.idx]), edges: new Set() });
+          } else if (hit.idx !== pendingEdgeSource) {
+            // Second click - create edge
+            const cmd = new AddEdgeCommand(graph, pendingEdgeSource, hit.idx);
+            commandHistoryRef.current.execute(cmd);
+            const newEdgeIdx = cmd.getEdgeIdx();
+            if (newEdgeIdx >= 0) {
+              setSelection({ nodes: new Set(), edges: new Set([newEdgeIdx]) });
+            }
+            setPendingEdgeSource(null);
+            renderer.setPreviewEdge(false);
+            updateStats();
+          }
+        } else {
+          // Click on empty space - cancel
+          setPendingEdgeSource(null);
+          renderer.setPreviewEdge(false);
+        }
+        break;
+      }
+
+      case 'delete': {
+        const hit = hitTest(screenX, screenY);
+        if (hit.type === 'node') {
+          const cmd = new BatchDeleteCommand(graph, [hit.idx], []);
+          commandHistoryRef.current.execute(cmd);
+          setSelection(createEmptySelection());
+          updateStats();
+        } else if (hit.type === 'edge') {
+          const cmd = new BatchDeleteCommand(graph, [], [hit.idx]);
+          commandHistoryRef.current.execute(cmd);
+          setSelection(createEmptySelection());
+          updateStats();
+        }
+        break;
+      }
+    }
+  }, [mode, selection, pendingEdgeSource, hitTest, updateStats]);
 
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
-    if (!isDragging.current || !rendererRef.current) return;
-    
-    const dx = e.clientX - lastMouse.current.x;
-    const dy = e.clientY - lastMouse.current.y;
-    
-    rendererRef.current.pan(dx, dy);
-    
-    lastMouse.current = { x: e.clientX, y: e.clientY };
-  }, []);
+    const renderer = rendererRef.current;
+    const graph = graphRef.current;
+    if (!renderer || !graph) return;
 
-  const handleMouseUp = useCallback(() => {
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    const screenX = (e.clientX - rect.left) * dpr;
+    const screenY = (e.clientY - rect.top) * dpr;
+    const world = renderer.screenToWorld(screenX, screenY);
+
+    // Preview edge in addEdge mode
+    if (mode === 'addEdge' && pendingEdgeSource !== null) {
+      const srcX = graph.nodeX[pendingEdgeSource];
+      const srcY = graph.nodeY[pendingEdgeSource];
+      renderer.setPreviewEdge(true, srcX, srcY, world.x, world.y);
+    }
+
+    if (!isDragging.current) return;
+
+    const dx = e.clientX - dragStartScreen.current.x;
+    const dy = e.clientY - dragStartScreen.current.y;
+
+    switch (mode) {
+      case 'pan':
+        renderer.pan(dx, dy);
+        dragStartScreen.current = { x: e.clientX, y: e.clientY };
+        break;
+
+      case 'select':
+        // Drag selected nodes
+        if (draggedNodes.current.size > 0) {
+          const deltaX = world.x - dragStartWorld.current.x;
+          const deltaY = world.y - dragStartWorld.current.y;
+
+          for (const [nodeIdx, start] of draggedNodes.current) {
+            graph.updateNode(nodeIdx, start.startX + deltaX, start.startY + deltaY);
+          }
+        }
+        break;
+    }
+  }, [mode, pendingEdgeSource]);
+
+  const handleMouseUp = useCallback((e: React.MouseEvent) => {
+    const graph = graphRef.current;
+
+    // Finalize node drag as a command
+    if (mode === 'select' && isDragging.current && draggedNodes.current.size > 0 && graph) {
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvasRef.current?.getBoundingClientRect();
+      if (rect && rendererRef.current) {
+        const screenX = (e.clientX - rect.left) * dpr;
+        const screenY = (e.clientY - rect.top) * dpr;
+        const world = rendererRef.current.screenToWorld(screenX, screenY);
+
+        // Check if actually moved
+        const movedDistance = Math.hypot(
+          world.x - dragStartWorld.current.x,
+          world.y - dragStartWorld.current.y
+        );
+
+        if (movedDistance > 1) {
+          // Create move commands for all dragged nodes
+          // For simplicity, we create individual commands (could optimize to batch)
+          for (const [nodeIdx, start] of draggedNodes.current) {
+            const cmd = new MoveNodeCommand(graph, nodeIdx, graph.nodeX[nodeIdx], graph.nodeY[nodeIdx]);
+            // Override the old position for correct undo
+            (cmd as any).oldX = start.startX;
+            (cmd as any).oldY = start.startY;
+            commandHistoryRef.current.execute(cmd);
+          }
+          updateStats();
+        }
+      }
+    }
+
     isDragging.current = false;
-  }, []);
+    draggedNodes.current.clear();
+  }, [mode, updateStats]);
 
   const handleWheel = useCallback((e: React.WheelEvent) => {
     if (!rendererRef.current) return;
@@ -166,9 +440,9 @@ function App() {
     rendererRef.current.zoomAt(x, y, factor);
   }, []);
 
+  // Actions
   const resetView = useCallback(() => {
-    if (!rendererRef.current) return;
-    rendererRef.current.setCamera(0, 0, 0.1);
+    rendererRef.current?.setCamera(0, 0, 0.1);
   }, []);
 
   const toggleBasemap = useCallback(() => {
@@ -186,6 +460,51 @@ function App() {
       rendererRef.current.setTileProvider(provider);
     }
   }, []);
+
+  const deleteSelection = useCallback(() => {
+    const graph = graphRef.current;
+    if (!graph || selectionCount(selection) === 0) return;
+
+    const cmd = new BatchDeleteCommand(
+      graph,
+      Array.from(selection.nodes),
+      Array.from(selection.edges)
+    );
+    commandHistoryRef.current.execute(cmd);
+    setSelection(createEmptySelection());
+    updateStats();
+  }, [selection, updateStats]);
+
+  const undo = useCallback(() => {
+    const cmd = commandHistoryRef.current.undo();
+    if (cmd) {
+      setSelection(createEmptySelection());
+      updateStats();
+    }
+  }, [updateStats]);
+
+  const redo = useCallback(() => {
+    const cmd = commandHistoryRef.current.redo();
+    if (cmd) {
+      setSelection(createEmptySelection());
+      updateStats();
+    }
+  }, [updateStats]);
+
+  // Cursor based on mode and state
+  const getCursor = useCallback(() => {
+    if (isDragging.current) {
+      return mode === 'pan' ? 'grabbing' : 'move';
+    }
+    switch (mode) {
+      case 'pan': return 'grab';
+      case 'select': return 'default';
+      case 'addNode': return 'crosshair';
+      case 'addEdge': return pendingEdgeSource !== null ? 'crosshair' : 'pointer';
+      case 'delete': return 'not-allowed';
+      default: return 'default';
+    }
+  }, [mode, pendingEdgeSource]);
 
   if (error) {
     return (
@@ -208,35 +527,85 @@ function App() {
       <div className="overlay">
         <h1>Network Inspector</h1>
         {!loading && (
-          <div className="controls">
-            <button onClick={resetView}>Reset View</button>
-            <button 
-              onClick={toggleBasemap}
-              className={basemapEnabled ? 'active' : ''}
-            >
-              {basemapEnabled ? 'Hide Map' : 'Show Map'}
-            </button>
-          </div>
-        )}
-        {!loading && basemapEnabled && (
-          <div className="basemap-selector">
-            {BASEMAP_OPTIONS.map(opt => (
-              <button
-                key={opt.id}
-                onClick={() => changeBasemapStyle(opt.id)}
-                className={basemapStyle === opt.id ? 'active' : ''}
-              >
-                {opt.label}
+          <>
+            {/* Mode toolbar */}
+            <div className="toolbar">
+              {EDITOR_MODES.map(m => (
+                <button
+                  key={m.id}
+                  onClick={() => {
+                    setMode(m.id);
+                    if (m.id !== 'addEdge') setPendingEdgeSource(null);
+                    rendererRef.current?.setPreviewEdge(false);
+                  }}
+                  className={mode === m.id ? 'active' : ''}
+                  title={`${m.label} (${m.shortcut})`}
+                >
+                  <span className="icon">{m.icon}</span>
+                  <span className="label">{m.label}</span>
+                </button>
+              ))}
+            </div>
+
+            {/* Action buttons */}
+            <div className="controls">
+              <button onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z)">
+                ↶ Undo
               </button>
-            ))}
-          </div>
+              <button onClick={redo} disabled={!canRedo} title="Redo (Ctrl+Y)">
+                ↷ Redo
+              </button>
+              <button
+                onClick={deleteSelection}
+                disabled={selectionCount(selection) === 0}
+                title="Delete Selection (Del)"
+              >
+                🗑 Delete
+              </button>
+              <span className="separator" />
+              <button onClick={resetView}>Reset View</button>
+              <button 
+                onClick={toggleBasemap}
+                className={basemapEnabled ? 'active' : ''}
+              >
+                {basemapEnabled ? 'Hide Map' : 'Show Map'}
+              </button>
+            </div>
+
+            {/* Basemap selector */}
+            {basemapEnabled && (
+              <div className="basemap-selector">
+                {BASEMAP_OPTIONS.map(opt => (
+                  <button
+                    key={opt.id}
+                    onClick={() => changeBasemapStyle(opt.id)}
+                    className={basemapStyle === opt.id ? 'active' : ''}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </>
         )}
       </div>
 
+      {/* Status bar */}
       <div className="stats">
         <span>{stats.nodes.toLocaleString()} nodes</span>
         <span>{stats.edges.toLocaleString()} edges</span>
         <span>{stats.fps} fps</span>
+        {selectionCount(selection) > 0 && (
+          <span className="selection-info">
+            {selection.nodes.size > 0 && `${selection.nodes.size} nodes`}
+            {selection.nodes.size > 0 && selection.edges.size > 0 && ', '}
+            {selection.edges.size > 0 && `${selection.edges.size} edges`}
+            {' selected'}
+          </span>
+        )}
+        {pendingEdgeSource !== null && (
+          <span className="mode-hint">Click target node to create edge</span>
+        )}
       </div>
 
       <canvas
@@ -246,7 +615,7 @@ function App() {
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
         onWheel={handleWheel}
-        style={{ cursor: isDragging.current ? 'grabbing' : 'grab' }}
+        style={{ cursor: getCursor() }}
       />
     </div>
   );
