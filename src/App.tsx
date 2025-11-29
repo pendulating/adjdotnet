@@ -22,19 +22,26 @@ function App() {
   const lastMouse = useRef({ x: 0, y: 0 });
 
   useEffect(() => {
+    let cancelled = false;
+    
     async function init() {
-      if (!canvasRef.current) return;
-
       try {
         // Load metadata first
         const metaRes = await fetch('/data/network_metadata.json');
         const metadata: NetworkMetadata = await metaRes.json();
 
+        if (cancelled) return;
+
         // Init DuckDB
         const db = DuckDBLayer.getInstance();
         await db.init();
+        
+        if (cancelled) return;
+
         await db.loadParquet('/data/nodes.parquet', 'nodes');
         await db.loadParquet('/data/edges.parquet', 'edges');
+
+        if (cancelled) return;
 
         // Load data to GraphState
         const graph = new GraphState();
@@ -43,10 +50,16 @@ function App() {
         
         graph.loadFromArrow(nodesResult, edgesResult);
 
+        if (cancelled) return;
+
         setStats(s => ({ ...s, nodes: graph.nodeCount, edges: graph.edgeCount }));
 
-        // Init WebGPU
+        // Wait for canvas to be ready
         const canvas = canvasRef.current;
+        if (!canvas) {
+          console.error('Canvas not ready');
+          return;
+        }
         
         // Set canvas size to match display
         const dpr = window.devicePixelRatio || 1;
@@ -57,8 +70,14 @@ function App() {
         const renderer = new WebGPURenderer(canvas, graph);
         await renderer.init();
 
-        // Center camera on data
-        renderer.setCamera(metadata.center_x, metadata.center_y, 0.5);
+        if (cancelled) {
+          renderer.destroy();
+          return;
+        }
+
+        // Center camera on data (node positions are offsets from center, so center at origin)
+        // Initial zoom based on typical sidewalk network extent (~2km)
+        renderer.setCamera(0, 0, 0.1);
 
         renderer.setStatsCallback(({ fps }) => {
           setStats(s => ({ ...s, fps }));
@@ -68,15 +87,19 @@ function App() {
         setLoading(false);
 
       } catch (e) {
-        console.error(e);
-        setError(e instanceof Error ? e.message : 'Failed to initialize');
+        if (!cancelled) {
+          console.error(e);
+          setError(e instanceof Error ? e.message : 'Failed to initialize');
+        }
       }
     }
 
     init();
 
     return () => {
+      cancelled = true;
       rendererRef.current?.destroy();
+      rendererRef.current = null;
     };
   }, []);
 
@@ -129,15 +152,9 @@ function App() {
     rendererRef.current.zoomAt(x, y, factor);
   }, []);
 
-  const resetView = useCallback(async () => {
+  const resetView = useCallback(() => {
     if (!rendererRef.current) return;
-    try {
-      const metaRes = await fetch('/data/network_metadata.json');
-      const metadata: NetworkMetadata = await metaRes.json();
-      rendererRef.current.setCamera(metadata.center_x, metadata.center_y, 0.5);
-    } catch (e) {
-      console.error('Failed to reset view:', e);
-    }
+    rendererRef.current.setCamera(0, 0, 0.1);
   }, []);
 
   if (error) {

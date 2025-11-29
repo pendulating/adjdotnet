@@ -93,7 +93,7 @@ struct Node {
 
 struct Edge {
   source: u32,
-  target: u32,
+  dest: u32,
 };
 
 @group(0) @binding(2) var<storage, read> edges: array<Edge>;
@@ -101,10 +101,10 @@ struct Edge {
 @vertex
 fn vs_main(@builtin(vertex_index) vIdx: u32) -> @builtin(position) vec4f {
   let edgeIdx = vIdx / 2u;
-  let isTarget = (vIdx % 2u) == 1u;
+  let isDest = (vIdx % 2u) == 1u;
   
   let edge = edges[edgeIdx];
-  let nodeIdx = select(edge.source, edge.target, isTarget);
+  let nodeIdx = select(edge.source, edge.dest, isDest);
   let node = nodes[nodeIdx];
   
   let worldPos = vec4f(node.pos, 0.0, 1.0);
