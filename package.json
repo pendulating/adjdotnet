@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "devDependencies": {
+    "@vitejs/plugin-react": "^5.1.1",
     "@webgpu/types": "^0.1.66",
     "jsdom": "^27.2.0",
     "typescript": "~5.9.3",
@@ -21,6 +22,8 @@
     "@types/react-dom": "^19.2.3",
     "apache-arrow": "^21.1.0",
     "deck.gl": "^9.2.2",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
     "wgpu-matrix": "^3.4.0"
   }
 }
