@@ -1,0 +1,15 @@
+{
+  "name": "rust-graph",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "rust_graph_bg.wasm",
+    "rust_graph.js",
+    "rust_graph.d.ts"
+  ],
+  "main": "rust_graph.js",
+  "types": "rust_graph.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
