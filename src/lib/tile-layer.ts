@@ -18,6 +18,7 @@ export interface TileProvider {
   maxZoom: number;
 }
 
+// Standard basemap providers
 export const TILE_PROVIDERS: Record<string, TileProvider> = {
   osm: {
     name: 'OpenStreetMap',
@@ -42,6 +43,17 @@ export const TILE_PROVIDERS: Record<string, TileProvider> = {
     url: 'https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png',
     attribution: '© CARTO © OpenStreetMap contributors',
     maxZoom: 20,
+  },
+};
+
+// Custom/regional basemap providers
+export const CUSTOM_TILE_PROVIDERS: Record<string, TileProvider> = {
+  nycOrthos2024: {
+    name: 'NYC 2024 Satellite',
+    // ArcGIS tile service uses {z}/{y}/{x} format
+    url: 'https://tiles.arcgis.com/tiles/yG5s3afENB5iO9fj/arcgis/rest/services/NYC_Orthos_2024/MapServer/tile/{z}/{y}/{x}',
+    attribution: '© NYC OTI',
+    maxZoom: 23,
   },
 };
 

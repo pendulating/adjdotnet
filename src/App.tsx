@@ -3,7 +3,7 @@ import './App.css';
 import { WebGPURenderer } from './lib/renderer';
 import { GraphState } from './lib/graph-state';
 import { DuckDBLayer } from './lib/duckdb';
-import { TILE_PROVIDERS } from './lib/tile-layer';
+import { TILE_PROVIDERS, CUSTOM_TILE_PROVIDERS } from './lib/tile-layer';
 import type { EditorMode, Selection, Point } from './lib/editor-state';
 import {
   EDITOR_MODES,
@@ -50,6 +50,10 @@ const BASEMAP_OPTIONS = [
   { id: 'cartoLight', label: 'Light' },
   { id: 'cartoVoyager', label: 'Voyager' },
   { id: 'osm', label: 'OpenStreetMap' },
+] as const;
+
+const CUSTOM_BASEMAP_OPTIONS = [
+  { id: 'nycOrthos2024', label: 'NYC 2024 Satellite' },
 ] as const;
 
 // Hit detection threshold in pixels
@@ -746,7 +750,9 @@ function App() {
 
   const changeBasemapStyle = useCallback((styleId: string) => {
     setBasemapStyle(styleId);
-    const provider = TILE_PROVIDERS[styleId as keyof typeof TILE_PROVIDERS];
+    // Check both standard and custom providers
+    const provider = TILE_PROVIDERS[styleId as keyof typeof TILE_PROVIDERS] 
+      || CUSTOM_TILE_PROVIDERS[styleId as keyof typeof CUSTOM_TILE_PROVIDERS];
     if (provider && rendererRef.current) {
       rendererRef.current.setTileProvider(provider);
     }
@@ -1030,17 +1036,33 @@ function App() {
 
             {/* Basemap selector */}
             {basemapEnabled && (
-              <div className="basemap-selector">
-                {BASEMAP_OPTIONS.map(opt => (
-                  <button
-                    key={opt.id}
-                    onClick={() => changeBasemapStyle(opt.id)}
-                    className={basemapStyle === opt.id ? 'active' : ''}
-                  >
-                    {opt.label}
-                  </button>
-                ))}
-              </div>
+              <>
+                <div className="basemap-selector">
+                  {BASEMAP_OPTIONS.map(opt => (
+                    <button
+                      key={opt.id}
+                      onClick={() => changeBasemapStyle(opt.id)}
+                      className={basemapStyle === opt.id ? 'active' : ''}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+                
+                {/* Custom basemaps */}
+                <div className="basemap-selector custom-basemaps">
+                  <span className="basemap-label">Custom:</span>
+                  {CUSTOM_BASEMAP_OPTIONS.map(opt => (
+                    <button
+                      key={opt.id}
+                      onClick={() => changeBasemapStyle(opt.id)}
+                      className={basemapStyle === opt.id ? 'active satellite' : ''}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </>
             )}
           </>
         )}
