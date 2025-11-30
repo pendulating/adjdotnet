@@ -66,7 +66,7 @@ function App() {
   // Analysis state
   const [showAnalysisPanel, setShowAnalysisPanel] = useState(false);
   const [graphStats, setGraphStats] = useState<GraphStatistics | null>(null);
-  const [showComponentColoring, setShowComponentColoring] = useState(false);
+  const [colorMode, setColorModeState] = useState<0 | 1 | 2>(0); // 0=none, 1=all components, 2=highlight giant
   const [isComputing, setIsComputing] = useState(false);
 
   // Drag state
@@ -536,14 +536,13 @@ function App() {
     }, 10);
   }, []);
 
-  const toggleComponentColoring = useCallback(() => {
+  const setColorMode = useCallback((mode: 0 | 1 | 2) => {
     const renderer = rendererRef.current;
     if (!renderer) return;
 
-    const newValue = !showComponentColoring;
-    setShowComponentColoring(newValue);
-    renderer.setComponentColoring(newValue);
-  }, [showComponentColoring]);
+    setColorModeState(mode);
+    renderer.setColorMode(mode);
+  }, []);
 
   const removeIsolatedNodes = useCallback(() => {
     const graph = graphRef.current;
@@ -571,12 +570,12 @@ function App() {
       setIsComputing(false);
       updateStats();
       computeStatistics();
-      if (showComponentColoring) {
-        rendererRef.current?.updateComponentMask();
+      if (colorMode !== 0) {
+        rendererRef.current?.updateComponentIds();
       }
       alert(`Removed ${removed} nodes from smaller components`);
     }, 10);
-  }, [updateStats, computeStatistics, showComponentColoring]);
+  }, [updateStats, computeStatistics, colorMode]);
 
   const selectGiantComponent = useCallback(() => {
     const graph = graphRef.current;
@@ -733,11 +732,18 @@ function App() {
                 <div className="action-group">
                   <h4>Visualization</h4>
                   <button
-                    onClick={toggleComponentColoring}
-                    className={showComponentColoring ? 'active' : ''}
+                    onClick={() => setColorMode(colorMode === 1 ? 0 : 1)}
+                    className={colorMode === 1 ? 'active' : ''}
                   >
-                    {showComponentColoring ? '● ' : '○ '}
-                    Show Components
+                    {colorMode === 1 ? '● ' : '○ '}
+                    Color All Components
+                  </button>
+                  <button
+                    onClick={() => setColorMode(colorMode === 2 ? 0 : 2)}
+                    className={colorMode === 2 ? 'active highlight-giant' : ''}
+                  >
+                    {colorMode === 2 ? '● ' : '○ '}
+                    Highlight Giant Only
                   </button>
                   <button onClick={selectGiantComponent}>
                     Select Giant Component

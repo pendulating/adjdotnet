@@ -445,6 +445,12 @@ canvas {
   color: #4ade80;
 }
 
+.action-group button.active.highlight-giant {
+  background: rgba(59, 130, 246, 0.15);
+  border-color: #3b82f6;
+  color: #60a5fa;
+}
+
 .action-group button.destructive {
   color: #f87171;
   border-color: #3f1f1f;
