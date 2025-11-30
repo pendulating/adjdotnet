@@ -4,18 +4,21 @@ import { WebGPURenderer } from './lib/renderer';
 import { GraphState } from './lib/graph-state';
 import { DuckDBLayer } from './lib/duckdb';
 import { TILE_PROVIDERS } from './lib/tile-layer';
-import type { EditorMode, Selection } from './lib/editor-state';
+import type { EditorMode, Selection, Point } from './lib/editor-state';
 import {
   EDITOR_MODES,
   createEmptySelection,
   toggleNodeSelection,
   toggleEdgeSelection,
   selectionCount,
+  selectNodes,
   CommandHistory,
   AddNodeCommand,
   AddEdgeCommand,
   MoveNodeCommand,
   BatchDeleteCommand,
+  findNodesInPolygon,
+  simplifyPath,
 } from './lib/editor-state';
 
 interface NetworkMetadata {
@@ -74,6 +77,11 @@ function App() {
   const dragStartScreen = useRef({ x: 0, y: 0 });
   const dragStartWorld = useRef({ x: 0, y: 0 });
   const draggedNodes = useRef<Map<number, { startX: number; startY: number }>>(new Map());
+
+  // Polygon/Lasso selection state
+  const [polygonPoints, setPolygonPoints] = useState<Point[]>([]);
+  const [isDrawingLasso, setIsDrawingLasso] = useState(false);
+  const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
 
   // Initialize
   useEffect(() => {
@@ -172,6 +180,67 @@ function App() {
     rendererRef.current?.setSelection(selection);
   }, [selection]);
 
+  // Draw polygon/lasso overlay
+  useEffect(() => {
+    const overlayCanvas = overlayCanvasRef.current;
+    const mainCanvas = canvasRef.current;
+    const renderer = rendererRef.current;
+    if (!overlayCanvas || !mainCanvas || !renderer) return;
+
+    // Match overlay canvas size to main canvas
+    const rect = mainCanvas.getBoundingClientRect();
+    overlayCanvas.width = rect.width;
+    overlayCanvas.height = rect.height;
+
+    const ctx = overlayCanvas.getContext('2d');
+    if (!ctx) return;
+
+    // Clear canvas
+    ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+    // Draw polygon/lasso if we have points
+    if (polygonPoints.length < 2) return;
+
+    // Convert world coordinates to screen coordinates
+    const dpr = window.devicePixelRatio || 1;
+    const screenPoints = polygonPoints.map(p => {
+      const screen = renderer.worldToScreen(p.x, p.y);
+      return { x: screen.x / dpr, y: screen.y / dpr };
+    });
+
+    // Draw the polygon path
+    ctx.beginPath();
+    ctx.moveTo(screenPoints[0].x, screenPoints[0].y);
+    for (let i = 1; i < screenPoints.length; i++) {
+      ctx.lineTo(screenPoints[i].x, screenPoints[i].y);
+    }
+
+    // Close the path if we're in polygon mode and have enough points
+    if (mode === 'polygonSelect' && polygonPoints.length >= 3) {
+      ctx.closePath();
+    }
+
+    // Fill with semi-transparent color
+    ctx.fillStyle = 'rgba(59, 130, 246, 0.15)';
+    ctx.fill();
+
+    // Stroke the outline
+    ctx.strokeStyle = mode === 'lassoSelect' ? '#22c55e' : '#3b82f6';
+    ctx.lineWidth = 2;
+    ctx.setLineDash(mode === 'polygonSelect' ? [5, 5] : []);
+    ctx.stroke();
+
+    // Draw vertices for polygon mode
+    if (mode === 'polygonSelect') {
+      ctx.fillStyle = '#3b82f6';
+      for (const p of screenPoints) {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }, [polygonPoints, mode]);
+
   // Handle resize
   useEffect(() => {
     const handleResize = () => {
@@ -195,15 +264,25 @@ function App() {
       // Mode shortcuts
       if (!e.ctrlKey && !e.metaKey) {
         switch (e.key.toLowerCase()) {
-          case 'v': setMode('pan'); return;
-          case 's': setMode('select'); return;
-          case 'n': setMode('addNode'); return;
-          case 'e': setMode('addEdge'); setPendingEdgeSource(null); return;
-          case 'x': setMode('delete'); return;
+          case 'v': setMode('pan'); setPolygonPoints([]); return;
+          case 's': setMode('select'); setPolygonPoints([]); return;
+          case 'p': setMode('polygonSelect'); setPolygonPoints([]); return;
+          case 'l': setMode('lassoSelect'); setPolygonPoints([]); return;
+          case 'n': setMode('addNode'); setPolygonPoints([]); return;
+          case 'e': setMode('addEdge'); setPendingEdgeSource(null); setPolygonPoints([]); return;
+          case 'x': setMode('delete'); setPolygonPoints([]); return;
           case 'escape':
             setSelection(createEmptySelection());
             setPendingEdgeSource(null);
+            setPolygonPoints([]);
+            setIsDrawingLasso(false);
             rendererRef.current?.setPreviewEdge(false);
+            return;
+          case 'enter':
+            // Complete polygon selection
+            if (mode === 'polygonSelect' && polygonPoints.length >= 3) {
+              completePolygonSelection(e.shiftKey);
+            }
             return;
           case 'delete':
           case 'backspace':
@@ -357,8 +436,26 @@ function App() {
         }
         break;
       }
+
+      case 'polygonSelect': {
+        // Double-click to close polygon
+        if (e.detail === 2 && polygonPoints.length >= 3) {
+          completePolygonSelection(e.shiftKey);
+        } else {
+          // Add point to polygon
+          setPolygonPoints(prev => [...prev, world]);
+        }
+        break;
+      }
+
+      case 'lassoSelect': {
+        // Start lasso drawing
+        setIsDrawingLasso(true);
+        setPolygonPoints([world]);
+        break;
+      }
     }
-  }, [mode, selection, pendingEdgeSource, hitTest, updateStats]);
+  }, [mode, selection, pendingEdgeSource, hitTest, updateStats, polygonPoints]);
 
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
     const renderer = rendererRef.current;
@@ -402,8 +499,15 @@ function App() {
           }
         }
         break;
+
+      case 'lassoSelect':
+        // Add points while dragging
+        if (isDrawingLasso) {
+          setPolygonPoints(prev => [...prev, world]);
+        }
+        break;
     }
-  }, [mode, pendingEdgeSource]);
+  }, [mode, pendingEdgeSource, isDrawingLasso]);
 
   const handleMouseUp = useCallback((e: React.MouseEvent) => {
     const graph = graphRef.current;
@@ -438,9 +542,15 @@ function App() {
       }
     }
 
+    // Complete lasso selection
+    if (mode === 'lassoSelect' && isDrawingLasso && polygonPoints.length >= 3) {
+      completeLassoSelection(e.shiftKey);
+    }
+
     isDragging.current = false;
     draggedNodes.current.clear();
-  }, [mode, updateStats]);
+    setIsDrawingLasso(false);
+  }, [mode, updateStats, isDrawingLasso, polygonPoints]);
 
   const handleWheel = useCallback((e: React.WheelEvent) => {
     if (!rendererRef.current) return;
@@ -515,12 +625,40 @@ function App() {
     switch (mode) {
       case 'pan': return 'grab';
       case 'select': return 'default';
+      case 'polygonSelect': return 'crosshair';
+      case 'lassoSelect': return isDrawingLasso ? 'crosshair' : 'crosshair';
       case 'addNode': return 'crosshair';
       case 'addEdge': return pendingEdgeSource !== null ? 'crosshair' : 'pointer';
       case 'delete': return 'not-allowed';
       default: return 'default';
     }
-  }, [mode, pendingEdgeSource]);
+  }, [mode, pendingEdgeSource, isDrawingLasso]);
+
+  // Complete polygon selection
+  const completePolygonSelection = useCallback((addToSelection: boolean) => {
+    const graph = graphRef.current;
+    if (!graph || polygonPoints.length < 3) return;
+
+    const nodesInPolygon = findNodesInPolygon(graph, polygonPoints);
+    setSelection(selectNodes(selection, nodesInPolygon, addToSelection));
+    setPolygonPoints([]);
+  }, [polygonPoints, selection]);
+
+  // Complete lasso selection
+  const completeLassoSelection = useCallback((addToSelection: boolean) => {
+    const graph = graphRef.current;
+    if (!graph || polygonPoints.length < 3) return;
+
+    // Simplify the lasso path for performance
+    const minDist = 10 / (rendererRef.current?.camera.zoom || 1);
+    const simplified = simplifyPath(polygonPoints, minDist);
+    
+    if (simplified.length >= 3) {
+      const nodesInLasso = findNodesInPolygon(graph, simplified);
+      setSelection(selectNodes(selection, nodesInLasso, addToSelection));
+    }
+    setPolygonPoints([]);
+  }, [polygonPoints, selection]);
 
   // Analysis functions
   const computeStatistics = useCallback(() => {
@@ -619,6 +757,8 @@ function App() {
                   onClick={() => {
                     setMode(m.id);
                     if (m.id !== 'addEdge') setPendingEdgeSource(null);
+                    setPolygonPoints([]);
+                    setIsDrawingLasso(false);
                     rendererRef.current?.setPreviewEdge(false);
                   }}
                   className={mode === m.id ? 'active' : ''}
@@ -787,6 +927,14 @@ function App() {
         {pendingEdgeSource !== null && (
           <span className="mode-hint">Click target node to create edge</span>
         )}
+        {mode === 'polygonSelect' && polygonPoints.length > 0 && (
+          <span className="mode-hint">
+            {polygonPoints.length} points • Double-click or Enter to select
+          </span>
+        )}
+        {mode === 'lassoSelect' && !isDrawingLasso && (
+          <span className="mode-hint">Click and drag to draw selection</span>
+        )}
       </div>
 
       <canvas
@@ -797,6 +945,21 @@ function App() {
         onMouseLeave={handleMouseUp}
         onWheel={handleWheel}
         style={{ cursor: getCursor() }}
+      />
+      
+      {/* Overlay canvas for polygon/lasso drawing */}
+      <canvas
+        ref={overlayCanvasRef}
+        className="overlay-canvas"
+        style={{ 
+          pointerEvents: (mode === 'polygonSelect' || mode === 'lassoSelect') ? 'auto' : 'none',
+          cursor: getCursor() 
+        }}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
+        onWheel={handleWheel}
       />
     </div>
   );

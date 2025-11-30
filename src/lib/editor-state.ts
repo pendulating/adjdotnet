@@ -3,11 +3,13 @@ import { GraphState } from './graph-state';
 
 // ==================== EDITOR MODES ====================
 
-export type EditorMode = 'pan' | 'select' | 'addNode' | 'addEdge' | 'delete';
+export type EditorMode = 'pan' | 'select' | 'polygonSelect' | 'lassoSelect' | 'addNode' | 'addEdge' | 'delete';
 
 export const EDITOR_MODES: { id: EditorMode; label: string; shortcut: string; icon: string }[] = [
   { id: 'pan', label: 'Pan', shortcut: 'V', icon: '✋' },
   { id: 'select', label: 'Select', shortcut: 'S', icon: '⬚' },
+  { id: 'polygonSelect', label: 'Polygon', shortcut: 'P', icon: '⬡' },
+  { id: 'lassoSelect', label: 'Lasso', shortcut: 'L', icon: '◠' },
   { id: 'addNode', label: 'Add Node', shortcut: 'N', icon: '◉' },
   { id: 'addEdge', label: 'Add Edge', shortcut: 'E', icon: '╱' },
   { id: 'delete', label: 'Delete', shortcut: 'X', icon: '✕' },
@@ -63,6 +65,82 @@ export function selectNodes(sel: Selection, nodeIndices: number[], multi: boolea
     newNodes.add(idx);
   }
   return { nodes: newNodes, edges: newEdges };
+}
+
+// ==================== POLYGON/LASSO GEOMETRY ====================
+
+export interface Point {
+  x: number;
+  y: number;
+}
+
+/**
+ * Point-in-polygon test using ray casting algorithm
+ * Returns true if point is inside the polygon
+ */
+export function pointInPolygon(point: Point, polygon: Point[]): boolean {
+  if (polygon.length < 3) return false;
+  
+  let inside = false;
+  const n = polygon.length;
+  
+  for (let i = 0, j = n - 1; i < n; j = i++) {
+    const xi = polygon[i].x, yi = polygon[i].y;
+    const xj = polygon[j].x, yj = polygon[j].y;
+    
+    // Check if point is on a horizontal ray from point.x going right
+    const intersect = ((yi > point.y) !== (yj > point.y)) &&
+      (point.x < (xj - xi) * (point.y - yi) / (yj - yi) + xi);
+    
+    if (intersect) inside = !inside;
+  }
+  
+  return inside;
+}
+
+/**
+ * Find all nodes that are inside a polygon
+ */
+export function findNodesInPolygon(graph: GraphState, polygon: Point[]): number[] {
+  const result: number[] = [];
+  
+  for (let i = 0; i < graph.nodeCount; i++) {
+    const point = { x: graph.nodeX[i], y: graph.nodeY[i] };
+    if (pointInPolygon(point, polygon)) {
+      result.push(i);
+    }
+  }
+  
+  return result;
+}
+
+/**
+ * Simplify a path by removing points that are too close together
+ * Useful for lasso smoothing
+ */
+export function simplifyPath(points: Point[], minDistance: number): Point[] {
+  if (points.length < 2) return points;
+  
+  const result: Point[] = [points[0]];
+  let lastPoint = points[0];
+  
+  for (let i = 1; i < points.length; i++) {
+    const dx = points[i].x - lastPoint.x;
+    const dy = points[i].y - lastPoint.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    
+    if (dist >= minDistance) {
+      result.push(points[i]);
+      lastPoint = points[i];
+    }
+  }
+  
+  // Always include the last point
+  if (result[result.length - 1] !== points[points.length - 1]) {
+    result.push(points[points.length - 1]);
+  }
+  
+  return result;
 }
 
 // ==================== COMMAND PATTERN (UNDO/REDO) ====================
