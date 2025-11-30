@@ -143,15 +143,26 @@ export function getViewportBoundingBox(
 
 /**
  * Data API client - supports Socrata and ArcGIS FeatureServer
+ * Uses persistent IndexedDB cache with stale-while-revalidate
  */
 export class SocrataClient {
   private appToken: string | null;
-  private cache: Map<string, { data: GeoJSONFeatureCollection; timestamp: number }> = new Map();
-  private cacheMaxAge = 60000; // 1 minute cache
   private pendingRequests: Map<string, Promise<GeoJSONFeatureCollection>> = new Map();
+  private persistentCache: typeof import('./cache').persistentCache | null = null;
 
   constructor(appToken?: string) {
     this.appToken = appToken || import.meta.env.NYCOD_APP_TOKEN || null;
+    this.initPersistentCache();
+  }
+
+  private async initPersistentCache() {
+    try {
+      const { persistentCache } = await import('./cache');
+      this.persistentCache = persistentCache;
+      await persistentCache.init();
+    } catch (e) {
+      console.warn('Persistent cache not available:', e);
+    }
   }
 
   /**
@@ -221,27 +232,56 @@ export class SocrataClient {
   }
 
   /**
+   * Round bbox for cache key (reduces fragmentation)
+   */
+  private roundBbox(bbox: BoundingBox): { minLat: number; minLon: number; maxLat: number; maxLon: number } {
+    const precision = 4;
+    return {
+      minLat: parseFloat(bbox.minLat.toFixed(precision)),
+      minLon: parseFloat(bbox.minLon.toFixed(precision)),
+      maxLat: parseFloat(bbox.maxLat.toFixed(precision)),
+      maxLon: parseFloat(bbox.maxLon.toFixed(precision)),
+    };
+  }
+
+  /**
    * Generate cache key for a dataset + bbox query
    */
   private getCacheKey(dataset: SocrataDataset, bbox: BoundingBox): string {
-    // Round bbox to reduce cache fragmentation
-    const precision = 4;
-    return `${dataset.id}:${bbox.minLat.toFixed(precision)},${bbox.minLon.toFixed(precision)},${bbox.maxLat.toFixed(precision)},${bbox.maxLon.toFixed(precision)}`;
+    const rounded = this.roundBbox(bbox);
+    return `${dataset.id}:${rounded.minLat},${rounded.minLon},${rounded.maxLat},${rounded.maxLon}`;
   }
 
   /**
    * Fetch GeoJSON data from Socrata or ArcGIS FeatureServer
+   * Uses persistent cache with stale-while-revalidate
    */
   async fetchDataset(
     dataset: SocrataDataset,
     bbox: BoundingBox
   ): Promise<GeoJSONFeatureCollection> {
     const cacheKey = this.getCacheKey(dataset, bbox);
+    const roundedBbox = this.roundBbox(bbox);
     
-    // Check cache
-    const cached = this.cache.get(cacheKey);
-    if (cached && Date.now() - cached.timestamp < this.cacheMaxAge) {
-      return cached.data;
+    // Check persistent cache first
+    if (this.persistentCache) {
+      const cached = await this.persistentCache.getData<GeoJSONFeatureCollection>(
+        dataset.id,
+        roundedBbox
+      );
+      
+      if (cached) {
+        // If not stale, return immediately
+        if (!cached.isStale) {
+          console.log(`Cache hit for ${dataset.name} (fresh)`);
+          return cached.data;
+        }
+        
+        // Stale-while-revalidate: return cached data but refresh in background
+        console.log(`Cache hit for ${dataset.name} (stale, refreshing in background)`);
+        this.refreshInBackground(dataset, bbox, roundedBbox);
+        return cached.data;
+      }
     }
     
     // Check if request is already pending
@@ -251,38 +291,71 @@ export class SocrataClient {
     }
     
     // Make request
-    const url = this.buildUrl(dataset, bbox);
-    console.log(`Fetching ${dataset.type} data: ${dataset.name}`, { bbox, url });
-    
-    const requestPromise = fetch(url)
-      .then(async (response) => {
-        if (!response.ok) {
-          const errorText = await response.text();
-          throw new Error(`Socrata API error: ${response.status} - ${errorText}`);
-        }
-        return response.json() as Promise<GeoJSONFeatureCollection>;
-      })
-      .then((data) => {
-        // Cache result
-        this.cache.set(cacheKey, { data, timestamp: Date.now() });
-        this.pendingRequests.delete(cacheKey);
-        console.log(`Loaded ${data.features?.length || 0} features from ${dataset.name}`);
-        return data;
-      })
-      .catch((error) => {
-        this.pendingRequests.delete(cacheKey);
-        throw error;
-      });
-    
+    const requestPromise = this.fetchFromNetwork(dataset, bbox, roundedBbox);
     this.pendingRequests.set(cacheKey, requestPromise);
-    return requestPromise;
+    
+    try {
+      const data = await requestPromise;
+      this.pendingRequests.delete(cacheKey);
+      return data;
+    } catch (error) {
+      this.pendingRequests.delete(cacheKey);
+      throw error;
+    }
+  }
+
+  private async fetchFromNetwork(
+    dataset: SocrataDataset,
+    bbox: BoundingBox,
+    roundedBbox: { minLat: number; minLon: number; maxLat: number; maxLon: number }
+  ): Promise<GeoJSONFeatureCollection> {
+    const url = this.buildUrl(dataset, bbox);
+    console.log(`Fetching ${dataset.type} data: ${dataset.name}`, { bbox });
+    
+    const response = await fetch(url);
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`API error: ${response.status} - ${errorText}`);
+    }
+    
+    const data = await response.json() as GeoJSONFeatureCollection;
+    console.log(`Loaded ${data.features?.length || 0} features from ${dataset.name}`);
+    
+    // Store in persistent cache
+    if (this.persistentCache) {
+      this.persistentCache.setData(dataset.id, roundedBbox, data);
+    }
+    
+    return data;
+  }
+
+  private refreshInBackground(
+    dataset: SocrataDataset,
+    bbox: BoundingBox,
+    roundedBbox: { minLat: number; minLon: number; maxLat: number; maxLon: number }
+  ): void {
+    // Fire and forget background refresh
+    this.fetchFromNetwork(dataset, bbox, roundedBbox).catch((err) => {
+      console.warn(`Background refresh failed for ${dataset.name}:`, err);
+    });
   }
 
   /**
-   * Clear the cache
+   * Clear cache for a specific dataset
    */
-  clearCache(): void {
-    this.cache.clear();
+  async clearDatasetCache(datasetId: string): Promise<void> {
+    if (this.persistentCache) {
+      await this.persistentCache.clearDatasetCache(datasetId);
+    }
+  }
+
+  /**
+   * Clear all caches
+   */
+  async clearCache(): Promise<void> {
+    if (this.persistentCache) {
+      await this.persistentCache.clearAll();
+    }
   }
 }
 

@@ -92,18 +92,38 @@ export function zoomForResolution(metersPerPixel: number): number {
 }
 
 export class TileCache {
-  private cache = new Map<string, HTMLImageElement>();
-  private pending = new Map<string, Promise<HTMLImageElement>>();
-  private maxSize = 256;
+  private memoryCache = new Map<string, HTMLImageElement>();
+  private pending = new Map<string, Promise<HTMLImageElement | null>>();
+  private maxMemorySize = 100;
   private provider: TileProvider;
+  private providerId: string;
+  private persistentCache: typeof import('./cache').persistentCache | null = null;
 
   constructor(provider: TileProvider = TILE_PROVIDERS.cartoDark) {
     this.provider = provider;
+    this.providerId = this.getProviderId(provider);
+    this.initPersistentCache();
+  }
+
+  private async initPersistentCache() {
+    try {
+      const { persistentCache } = await import('./cache');
+      this.persistentCache = persistentCache;
+      await persistentCache.init();
+    } catch (e) {
+      console.warn('Persistent cache not available:', e);
+    }
+  }
+
+  private getProviderId(provider: TileProvider): string {
+    // Create a stable ID from the URL pattern
+    return provider.url.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 50);
   }
 
   setProvider(provider: TileProvider) {
     this.provider = provider;
-    this.cache.clear();
+    this.providerId = this.getProviderId(provider);
+    this.memoryCache.clear();
     this.pending.clear();
   }
 
@@ -121,36 +141,70 @@ export class TileCache {
   async getTile(tile: TileCoord): Promise<HTMLImageElement | null> {
     const key = this.tileKey(tile);
     
-    // Return cached
-    if (this.cache.has(key)) {
-      return this.cache.get(key)!;
+    // Check memory cache first
+    if (this.memoryCache.has(key)) {
+      return this.memoryCache.get(key)!;
     }
 
-    // Return pending
+    // Check if request is pending
     if (this.pending.has(key)) {
       return this.pending.get(key)!;
     }
 
-    // Fetch new tile
-    const promise = this.fetchTile(tile);
+    // Create promise that checks persistent cache then fetches
+    const promise = this.loadTile(tile);
     this.pending.set(key, promise);
 
     try {
       const img = await promise;
       this.pending.delete(key);
-      
-      // Evict old tiles if cache is full
-      if (this.cache.size >= this.maxSize) {
-        const firstKey = this.cache.keys().next().value;
-        if (firstKey) this.cache.delete(firstKey);
-      }
-      
-      this.cache.set(key, img);
       return img;
     } catch (e) {
       this.pending.delete(key);
       return null;
     }
+  }
+
+  private async loadTile(tile: TileCoord): Promise<HTMLImageElement | null> {
+    const key = this.tileKey(tile);
+
+    // Check persistent cache
+    if (this.persistentCache) {
+      const cached = await this.persistentCache.getTile(
+        this.providerId,
+        tile.z,
+        tile.x,
+        tile.y
+      );
+      if (cached) {
+        this.addToMemoryCache(key, cached);
+        return cached;
+      }
+    }
+
+    // Fetch from network
+    try {
+      const img = await this.fetchTile(tile);
+      this.addToMemoryCache(key, img);
+      
+      // Store in persistent cache
+      if (this.persistentCache) {
+        this.persistentCache.setTile(this.providerId, tile.z, tile.x, tile.y, img);
+      }
+      
+      return img;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  private addToMemoryCache(key: string, img: HTMLImageElement): void {
+    // Evict old tiles if cache is full
+    if (this.memoryCache.size >= this.maxMemorySize) {
+      const firstKey = this.memoryCache.keys().next().value;
+      if (firstKey) this.memoryCache.delete(firstKey);
+    }
+    this.memoryCache.set(key, img);
   }
 
   private fetchTile(tile: TileCoord): Promise<HTMLImageElement> {
@@ -164,7 +218,17 @@ export class TileCache {
   }
 
   getImmediate(tile: TileCoord): HTMLImageElement | null {
-    return this.cache.get(this.tileKey(tile)) || null;
+    return this.memoryCache.get(this.tileKey(tile)) || null;
+  }
+
+  /**
+   * Clear all tiles for current provider
+   */
+  async clearCache(): Promise<void> {
+    this.memoryCache.clear();
+    if (this.persistentCache) {
+      await this.persistentCache.clearProviderTiles(this.providerId);
+    }
   }
 }
 
