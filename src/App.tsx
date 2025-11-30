@@ -80,7 +80,7 @@ function App() {
 
   // Polygon/Lasso selection state
   const [polygonPoints, setPolygonPoints] = useState<Point[]>([]);
-  const [isDrawingLasso, setIsDrawingLasso] = useState(false);
+  const isDrawingLassoRef = useRef(false);
   const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
 
   // Initialize
@@ -215,13 +215,15 @@ function App() {
       ctx.lineTo(screenPoints[i].x, screenPoints[i].y);
     }
 
-    // Close the path if we're in polygon mode and have enough points
-    if (mode === 'polygonSelect' && polygonPoints.length >= 3) {
+    // Close the path for filling (both polygon and lasso)
+    if (polygonPoints.length >= 3) {
       ctx.closePath();
     }
 
     // Fill with semi-transparent color
-    ctx.fillStyle = 'rgba(59, 130, 246, 0.15)';
+    ctx.fillStyle = mode === 'lassoSelect' 
+      ? 'rgba(34, 197, 94, 0.2)'  // Green for lasso
+      : 'rgba(59, 130, 246, 0.15)'; // Blue for polygon
     ctx.fill();
 
     // Stroke the outline
@@ -450,7 +452,7 @@ function App() {
 
       case 'lassoSelect': {
         // Start lasso drawing
-        setIsDrawingLasso(true);
+        isDrawingLassoRef.current = true;
         setPolygonPoints([world]);
         break;
       }
@@ -477,6 +479,12 @@ function App() {
       renderer.setPreviewEdge(true, srcX, srcY, world.x, world.y);
     }
 
+    // Lasso drawing - handle before isDragging check since it uses its own ref
+    if (mode === 'lassoSelect' && isDrawingLassoRef.current) {
+      setPolygonPoints(prev => [...prev, world]);
+      return;
+    }
+
     if (!isDragging.current) return;
 
     const dx = e.clientX - dragStartScreen.current.x;
@@ -499,15 +507,8 @@ function App() {
           }
         }
         break;
-
-      case 'lassoSelect':
-        // Add points while dragging
-        if (isDrawingLasso) {
-          setPolygonPoints(prev => [...prev, world]);
-        }
-        break;
     }
-  }, [mode, pendingEdgeSource, isDrawingLasso]);
+  }, [mode, pendingEdgeSource]);
 
   const handleMouseUp = useCallback((e: React.MouseEvent) => {
     const graph = graphRef.current;
@@ -543,14 +544,14 @@ function App() {
     }
 
     // Complete lasso selection
-    if (mode === 'lassoSelect' && isDrawingLasso && polygonPoints.length >= 3) {
+    if (mode === 'lassoSelect' && isDrawingLassoRef.current && polygonPoints.length >= 3) {
       completeLassoSelection(e.shiftKey);
     }
 
     isDragging.current = false;
     draggedNodes.current.clear();
-    setIsDrawingLasso(false);
-  }, [mode, updateStats, isDrawingLasso, polygonPoints]);
+    isDrawingLassoRef.current = false;
+  }, [mode, updateStats, polygonPoints]);
 
   const handleWheel = useCallback((e: React.WheelEvent) => {
     if (!rendererRef.current) return;
@@ -626,13 +627,13 @@ function App() {
       case 'pan': return 'grab';
       case 'select': return 'default';
       case 'polygonSelect': return 'crosshair';
-      case 'lassoSelect': return isDrawingLasso ? 'crosshair' : 'crosshair';
+      case 'lassoSelect': return 'crosshair';
       case 'addNode': return 'crosshair';
       case 'addEdge': return pendingEdgeSource !== null ? 'crosshair' : 'pointer';
       case 'delete': return 'not-allowed';
       default: return 'default';
     }
-  }, [mode, pendingEdgeSource, isDrawingLasso]);
+  }, [mode, pendingEdgeSource]);
 
   // Complete polygon selection
   const completePolygonSelection = useCallback((addToSelection: boolean) => {
@@ -932,7 +933,7 @@ function App() {
             {polygonPoints.length} points • Double-click or Enter to select
           </span>
         )}
-        {mode === 'lassoSelect' && !isDrawingLasso && (
+        {mode === 'lassoSelect' && polygonPoints.length === 0 && (
           <span className="mode-hint">Click and drag to draw selection</span>
         )}
       </div>
