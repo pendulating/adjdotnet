@@ -12,12 +12,20 @@ declare global {
   }
 }
 
+export type DatasetType = 'socrata' | 'arcgis';
+
 export interface SocrataDataset {
   id: string;
   name: string;
-  domain: string;      // e.g., "data.cityofnewyork.us"
-  resourceId: string;  // e.g., "5xvt-8cbk"
-  geometryColumn: string; // e.g., "the_geom"
+  type: DatasetType;
+  // Socrata-specific
+  domain?: string;      // e.g., "data.cityofnewyork.us"
+  resourceId?: string;  // e.g., "5xvt-8cbk"
+  geometryColumn?: string; // e.g., "the_geom"
+  // ArcGIS FeatureServer-specific
+  featureServerUrl?: string;  // e.g., "https://services6.arcgis.com/.../FeatureServer"
+  layerId?: number;           // e.g., 5
+  // Common
   color: string;       // Hex color for rendering
   enabled: boolean;
 }
@@ -55,15 +63,25 @@ export const RECIPES: Recipe[] = [
   {
     id: 'nyc-street-network',
     name: 'NYC Street Network',
-    description: 'Curbs, crosswalks, and street infrastructure from NYC Open Data',
+    description: 'Curbs, curb cuts, and street infrastructure from NYC Open Data',
     datasets: [
       {
         id: 'nyc-curbs',
         name: 'NYC Curbs',
+        type: 'socrata',
         domain: 'data.cityofnewyork.us',
         resourceId: '5xvt-8cbk',
         geometryColumn: 'the_geom',
         color: '#f59e0b', // Amber
+        enabled: true,
+      },
+      {
+        id: 'nyc-curb-cuts',
+        name: 'NYC Curb Cuts',
+        type: 'arcgis',
+        featureServerUrl: 'https://services6.arcgis.com/yG5s3afENB5iO9fj/arcgis/rest/services/Curb_Cut_2022/FeatureServer',
+        layerId: 5, // CURB_CUT layer
+        color: '#ec4899', // Pink
         enabled: true,
       },
     ],
@@ -115,7 +133,7 @@ export function getViewportBoundingBox(
 }
 
 /**
- * Socrata API client
+ * Data API client - supports Socrata and ArcGIS FeatureServer
  */
 export class SocrataClient {
   private appToken: string | null;
@@ -130,7 +148,7 @@ export class SocrataClient {
   /**
    * Build Socrata API URL with spatial query
    */
-  private buildUrl(
+  private buildSocrataUrl(
     dataset: SocrataDataset,
     bbox: BoundingBox,
     limit: number = 5000
@@ -154,6 +172,46 @@ export class SocrataClient {
   }
 
   /**
+   * Build ArcGIS FeatureServer URL with spatial query
+   */
+  private buildArcGISUrl(
+    dataset: SocrataDataset,
+    bbox: BoundingBox,
+    limit: number = 5000
+  ): string {
+    const baseUrl = `${dataset.featureServerUrl}/${dataset.layerId}/query`;
+    
+    // ArcGIS uses envelope geometry for spatial queries
+    // geometry format: xmin,ymin,xmax,ymax
+    const envelope = `${bbox.minLon},${bbox.minLat},${bbox.maxLon},${bbox.maxLat}`;
+    
+    const params = new URLSearchParams({
+      where: '1=1',
+      geometry: envelope,
+      geometryType: 'esriGeometryEnvelope',
+      inSR: '4326',    // Input spatial reference (WGS84)
+      outSR: '4326',   // Output spatial reference (WGS84)
+      spatialRel: 'esriSpatialRelIntersects',
+      outFields: '*',
+      returnGeometry: 'true',
+      resultRecordCount: limit.toString(),
+      f: 'geojson',
+    });
+    
+    return `${baseUrl}?${params.toString()}`;
+  }
+
+  /**
+   * Build URL based on dataset type
+   */
+  private buildUrl(dataset: SocrataDataset, bbox: BoundingBox, limit: number = 5000): string {
+    if (dataset.type === 'arcgis') {
+      return this.buildArcGISUrl(dataset, bbox, limit);
+    }
+    return this.buildSocrataUrl(dataset, bbox, limit);
+  }
+
+  /**
    * Generate cache key for a dataset + bbox query
    */
   private getCacheKey(dataset: SocrataDataset, bbox: BoundingBox): string {
@@ -163,7 +221,7 @@ export class SocrataClient {
   }
 
   /**
-   * Fetch GeoJSON data from Socrata API
+   * Fetch GeoJSON data from Socrata or ArcGIS FeatureServer
    */
   async fetchDataset(
     dataset: SocrataDataset,
@@ -185,7 +243,7 @@ export class SocrataClient {
     
     // Make request
     const url = this.buildUrl(dataset, bbox);
-    console.log(`Fetching Socrata data: ${dataset.name}`, { bbox, url });
+    console.log(`Fetching ${dataset.type} data: ${dataset.name}`, { bbox, url });
     
     const requestPromise = fetch(url)
       .then(async (response) => {
