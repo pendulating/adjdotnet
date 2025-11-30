@@ -60,7 +60,7 @@ function App() {
   const [basemapStyle, setBasemapStyle] = useState<string>('cartoDark');
 
   // Editor state
-  const [mode, setMode] = useState<EditorMode>('select');
+  const [mode, setMode] = useState<EditorMode>('pan');
   const [selection, setSelection] = useState<Selection>(createEmptySelection());
   const [pendingEdgeSource, setPendingEdgeSource] = useState<number | null>(null);
   const [canUndo, setCanUndo] = useState(false);
