@@ -738,7 +738,7 @@ function App() {
       )}
 
       <div className="overlay">
-        <h1>Network Inspector</h1>
+        <h1>Adj.NET</h1>
         {!loading && (
           <>
             <Toolbar mode={mode} onModeChange={handleModeChange} />

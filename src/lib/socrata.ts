@@ -63,8 +63,17 @@ export const RECIPES: Recipe[] = [
   {
     id: 'nyc-street-network',
     name: 'NYC Street Network',
-    description: 'Curbs, curb cuts, and street infrastructure from NYC Open Data',
+    description: 'Sidewalks, curbs, and curb cuts from NYC Open Data',
     datasets: [
+      {
+        id: 'nyc-sidewalks',
+        name: 'NYC Sidewalks',
+        type: 'arcgis',
+        featureServerUrl: 'https://services6.arcgis.com/yG5s3afENB5iO9fj/arcgis/rest/services/Sidewalk_2022/FeatureServer',
+        layerId: 22, // SIDEWALK layer
+        color: '#64748b', // Slate gray
+        enabled: true,
+      },
       {
         id: 'nyc-curbs',
         name: 'NYC Curbs',
