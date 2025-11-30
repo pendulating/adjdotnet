@@ -94,6 +94,20 @@ function App() {
   // Zoom threshold for loading overlay data (zoom level where we load datasets)
   const OVERLAY_ZOOM_THRESHOLD = 0.5;
 
+  // Camera change tracking for overlay data loading
+  const [cameraVersion, setCameraVersion] = useState(0);
+  const cameraChangeTimeout = useRef<number | null>(null);
+
+  // Debounced camera change notification
+  const notifyCameraChange = useCallback(() => {
+    if (cameraChangeTimeout.current) {
+      clearTimeout(cameraChangeTimeout.current);
+    }
+    cameraChangeTimeout.current = window.setTimeout(() => {
+      setCameraVersion(v => v + 1);
+    }, 300);
+  }, []);
+
   // Drag state
   const isDragging = useRef(false);
   const dragStartScreen = useRef({ x: 0, y: 0 });
@@ -384,16 +398,11 @@ function App() {
     }
   }, [activeDatasets]);
 
-  // Trigger overlay data loading on camera change (debounced)
+  // Trigger overlay data loading on camera change
   useEffect(() => {
     if (loading || activeDatasets.length === 0) return;
-    
-    const timer = setTimeout(() => {
-      loadOverlayData();
-    }, 300); // Debounce 300ms
-    
-    return () => clearTimeout(timer);
-  }, [loading, activeDatasets, loadOverlayData]);
+    loadOverlayData();
+  }, [loading, activeDatasets, loadOverlayData, cameraVersion]);
 
   // Handle resize
   useEffect(() => {
@@ -646,6 +655,7 @@ function App() {
       case 'pan':
         renderer.pan(dx, dy);
         dragStartScreen.current = { x: e.clientX, y: e.clientY };
+        notifyCameraChange();
         break;
 
       case 'select':
@@ -660,7 +670,7 @@ function App() {
         }
         break;
     }
-  }, [mode, pendingEdgeSource]);
+  }, [mode, pendingEdgeSource, notifyCameraChange]);
 
   const handleMouseUp = useCallback((e: React.MouseEvent) => {
     const graph = graphRef.current;
@@ -717,12 +727,14 @@ function App() {
     
     const factor = e.deltaY > 0 ? 0.9 : 1.1;
     rendererRef.current.zoomAt(x, y, factor);
-  }, []);
+    notifyCameraChange();
+  }, [notifyCameraChange]);
 
   // Actions
   const resetView = useCallback(() => {
     rendererRef.current?.setCamera(0, 0, 0.1);
-  }, []);
+    notifyCameraChange();
+  }, [notifyCameraChange]);
 
   const toggleBasemap = useCallback(() => {
     setBasemapEnabled(prev => {
