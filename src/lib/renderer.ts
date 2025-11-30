@@ -287,6 +287,48 @@ fn fs_main() -> @location(0) vec4f {
 }
 `;
 
+// GeoJSON overlay shader - renders lines from vertex buffer
+const GEOJSON_SHADER = `
+struct Camera {
+  projection: mat4x4f,
+  view: mat4x4f,
+  viewport: vec2f,
+  scale: f32,
+  _pad: f32,
+};
+
+@group(0) @binding(0) var<uniform> camera: Camera;
+
+struct OverlayParams {
+  color: vec4f,
+};
+
+@group(0) @binding(1) var<uniform> params: OverlayParams;
+
+struct VertexInput {
+  @location(0) position: vec2f,
+};
+
+@vertex
+fn vs_main(input: VertexInput) -> @builtin(position) vec4f {
+  return camera.projection * camera.view * vec4f(input.position, 0.0, 1.0);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4f {
+  return params.color;
+}
+`;
+
+export interface GeoJSONLayer {
+  id: string;
+  color: string;
+  vertexBuffer: GPUBuffer | null;
+  vertexCount: number;
+  paramsBuffer: GPUBuffer | null;
+  bindGroup: GPUBindGroup | null;
+}
+
 export interface CameraState {
   centerX: number;
   centerY: number;
@@ -307,6 +349,7 @@ export class WebGPURenderer {
   private edgePipeline: GPURenderPipeline | null = null;
   private tilePipeline: GPURenderPipeline | null = null;
   private previewEdgePipeline: GPURenderPipeline | null = null;
+  private geojsonPipeline: GPURenderPipeline | null = null;
 
   // Buffers
   private nodeBuffer: GPUBuffer | null = null;
@@ -318,6 +361,10 @@ export class WebGPURenderer {
   private colorModeBuffer: GPUBuffer | null = null;
   private previewEdgeBuffer: GPUBuffer | null = null;
   private tileBindGroupLayout: GPUBindGroupLayout | null = null;
+  private geojsonBindGroupLayout: GPUBindGroupLayout | null = null;
+
+  // GeoJSON overlay layers
+  private geojsonLayers: Map<string, GeoJSONLayer> = new Map();
 
   // Bind Groups
   private nodeBindGroup: GPUBindGroup | null = null;
@@ -507,6 +554,43 @@ export class WebGPURenderer {
       },
       fragment: {
         module: previewModule,
+        entryPoint: 'fs_main',
+        targets: [{
+          format: this.format,
+          blend: {
+            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          },
+        }],
+      },
+      primitive: { topology: 'line-list' },
+    });
+
+    // GeoJSON Overlay Pipeline
+    this.geojsonBindGroupLayout = this.device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+      ],
+    });
+
+    const geojsonModule = this.device.createShaderModule({ code: GEOJSON_SHADER });
+    this.geojsonPipeline = this.device.createRenderPipeline({
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [this.geojsonBindGroupLayout],
+      }),
+      vertex: {
+        module: geojsonModule,
+        entryPoint: 'vs_main',
+        buffers: [{
+          arrayStride: 8, // vec2f
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: 'float32x2' },
+          ],
+        }],
+      },
+      fragment: {
+        module: geojsonModule,
         entryPoint: 'fs_main',
         targets: [{
           format: this.format,
@@ -876,6 +960,18 @@ export class WebGPURenderer {
       renderPass.draw(2);
     }
 
+    // Draw GeoJSON overlay layers
+    if (this.geojsonPipeline) {
+      renderPass.setPipeline(this.geojsonPipeline);
+      for (const layer of this.geojsonLayers.values()) {
+        if (layer.vertexBuffer && layer.bindGroup && layer.vertexCount > 0) {
+          renderPass.setBindGroup(0, layer.bindGroup);
+          renderPass.setVertexBuffer(0, layer.vertexBuffer);
+          renderPass.draw(layer.vertexCount);
+        }
+      }
+    }
+
     // Draw nodes
     if (this.nodeBindGroup && this.graphState.nodeCount > 0) {
       renderPass.setPipeline(this.nodePipeline);
@@ -955,6 +1051,135 @@ export class WebGPURenderer {
     }
   }
 
+  // ==================== GEOJSON OVERLAY LAYERS ====================
+
+  /**
+   * Parse hex color to RGBA (0-1 range)
+   */
+  private hexToRgba(hex: string, alpha: number = 0.8): [number, number, number, number] {
+    const r = parseInt(hex.slice(1, 3), 16) / 255;
+    const g = parseInt(hex.slice(3, 5), 16) / 255;
+    const b = parseInt(hex.slice(5, 7), 16) / 255;
+    return [r, g, b, alpha];
+  }
+
+  /**
+   * Set or update a GeoJSON layer
+   * @param id Unique layer identifier
+   * @param vertices Array of [x, y] Web Mercator coordinates (line segments: [x1,y1,x2,y2,...])
+   * @param color Hex color string
+   */
+  public setGeoJSONLayer(id: string, vertices: number[], color: string): void {
+    if (!this.device || !this.uniformBuffer || !this.geojsonBindGroupLayout) return;
+
+    // Clean up existing layer
+    const existing = this.geojsonLayers.get(id);
+    if (existing) {
+      existing.vertexBuffer?.destroy();
+      existing.paramsBuffer?.destroy();
+    }
+
+    if (vertices.length < 4) {
+      this.geojsonLayers.delete(id);
+      return;
+    }
+
+    // Adjust coordinates relative to world center
+    const adjustedVertices = new Float32Array(vertices.length);
+    for (let i = 0; i < vertices.length; i += 2) {
+      adjustedVertices[i] = vertices[i] - this.worldCenterX;
+      adjustedVertices[i + 1] = vertices[i + 1] - this.worldCenterY;
+    }
+
+    // Create vertex buffer
+    const vertexBuffer = this.device.createBuffer({
+      size: adjustedVertices.byteLength,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true,
+    });
+    new Float32Array(vertexBuffer.getMappedRange()).set(adjustedVertices);
+    vertexBuffer.unmap();
+
+    // Create params buffer for color
+    const rgba = this.hexToRgba(color);
+    const paramsBuffer = this.device.createBuffer({
+      size: 16, // vec4f
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true,
+    });
+    new Float32Array(paramsBuffer.getMappedRange()).set(rgba);
+    paramsBuffer.unmap();
+
+    // Create bind group
+    const bindGroup = this.device.createBindGroup({
+      layout: this.geojsonBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.uniformBuffer } },
+        { binding: 1, resource: { buffer: paramsBuffer } },
+      ],
+    });
+
+    this.geojsonLayers.set(id, {
+      id,
+      color,
+      vertexBuffer,
+      vertexCount: vertices.length / 2,
+      paramsBuffer,
+      bindGroup,
+    });
+  }
+
+  /**
+   * Remove a GeoJSON layer
+   */
+  public removeGeoJSONLayer(id: string): void {
+    const layer = this.geojsonLayers.get(id);
+    if (layer) {
+      layer.vertexBuffer?.destroy();
+      layer.paramsBuffer?.destroy();
+      this.geojsonLayers.delete(id);
+    }
+  }
+
+  /**
+   * Clear all GeoJSON layers
+   */
+  public clearGeoJSONLayers(): void {
+    for (const layer of this.geojsonLayers.values()) {
+      layer.vertexBuffer?.destroy();
+      layer.paramsBuffer?.destroy();
+    }
+    this.geojsonLayers.clear();
+  }
+
+  /**
+   * Get viewport bounds in absolute Web Mercator coordinates
+   */
+  public getViewportBounds(): { minX: number; minY: number; maxX: number; maxY: number } {
+    const halfWidth = (this.canvas.width / 2) / this.camera.zoom;
+    const halfHeight = (this.canvas.height / 2) / this.camera.zoom;
+    
+    const absCenterX = this.worldCenterX + this.camera.centerX;
+    const absCenterY = this.worldCenterY + this.camera.centerY;
+    
+    return {
+      minX: absCenterX - halfWidth,
+      maxX: absCenterX + halfWidth,
+      minY: absCenterY - halfHeight,
+      maxY: absCenterY + halfHeight,
+    };
+  }
+
+  /**
+   * Get absolute world center (for coordinate system reference)
+   */
+  public getAbsoluteCenter(): { x: number; y: number } {
+    return {
+      x: this.worldCenterX + this.camera.centerX,
+      y: this.worldCenterY + this.camera.centerY,
+    };
+  }
+
   // ==================== COORDINATE CONVERSION ====================
 
   /**
@@ -1010,5 +1235,6 @@ export class WebGPURenderer {
     this.colorModeBuffer?.destroy();
     this.previewEdgeBuffer?.destroy();
     this.tileTextures.forEach(tex => tex.destroy());
+    this.clearGeoJSONLayers();
   }
 }

@@ -20,6 +20,14 @@ import {
   findNodesInPolygon,
   simplifyPath,
 } from './lib/editor-state';
+import {
+  SocrataClient,
+  RECIPES,
+  webMercatorToLatLon,
+  convertGeoJSONToWebMercator,
+  parseDatasetUrl,
+} from './lib/socrata';
+import type { SocrataDataset, Recipe } from './lib/socrata';
 
 interface NetworkMetadata {
   center_x: number;
@@ -71,6 +79,20 @@ function App() {
   const [graphStats, setGraphStats] = useState<GraphStatistics | null>(null);
   const [colorMode, setColorModeState] = useState<0 | 1 | 2>(0); // 0=none, 1=all components, 2=highlight giant
   const [isComputing, setIsComputing] = useState(false);
+
+  // Socrata/Recipes state
+  const [showRecipesPanel, setShowRecipesPanel] = useState(false);
+  const [activeDatasets, setActiveDatasets] = useState<SocrataDataset[]>([]);
+  const [customDatasetUrl, setCustomDatasetUrl] = useState('');
+  const [customDatasetName, setCustomDatasetName] = useState('');
+  const [customDatasetColor, setCustomDatasetColor] = useState('#22c55e');
+  const [datasetLoading, setDatasetLoading] = useState<string | null>(null);
+  const [datasetError, setDatasetError] = useState<string | null>(null);
+  const socrataClientRef = useRef<SocrataClient | null>(null);
+  const lastViewportRef = useRef<{ minX: number; minY: number; maxX: number; maxY: number } | null>(null);
+
+  // Zoom threshold for loading overlay data (zoom level where we load datasets)
+  const OVERLAY_ZOOM_THRESHOLD = 0.5;
 
   // Drag state
   const isDragging = useRef(false);
@@ -143,6 +165,10 @@ function App() {
         });
 
         rendererRef.current = renderer;
+        
+        // Initialize Socrata client
+        socrataClientRef.current = new SocrataClient();
+        
         setLoading(false);
 
       } catch (e) {
@@ -242,6 +268,132 @@ function App() {
       }
     }
   }, [polygonPoints, mode]);
+
+  // Load overlay data for active datasets when zoomed in
+  const loadOverlayData = useCallback(async () => {
+    const renderer = rendererRef.current;
+    const client = socrataClientRef.current;
+    if (!renderer || !client || activeDatasets.length === 0) return;
+
+    const zoom = renderer.camera.zoom;
+    if (zoom < OVERLAY_ZOOM_THRESHOLD) {
+      // Too zoomed out, clear overlay layers
+      for (const dataset of activeDatasets) {
+        renderer.removeGeoJSONLayer(dataset.id);
+      }
+      return;
+    }
+
+    const bounds = renderer.getViewportBounds();
+    
+    // Check if viewport has changed significantly
+    const last = lastViewportRef.current;
+    if (last) {
+      const threshold = 100; // meters
+      if (
+        Math.abs(bounds.minX - last.minX) < threshold &&
+        Math.abs(bounds.maxX - last.maxX) < threshold &&
+        Math.abs(bounds.minY - last.minY) < threshold &&
+        Math.abs(bounds.maxY - last.maxY) < threshold
+      ) {
+        return; // Viewport hasn't changed enough
+      }
+    }
+    lastViewportRef.current = bounds;
+
+    // Convert Web Mercator bounds to lat/lon for Socrata query
+    const minCorner = webMercatorToLatLon(bounds.minX, bounds.minY);
+    const maxCorner = webMercatorToLatLon(bounds.maxX, bounds.maxY);
+    
+    const bbox = {
+      minLat: minCorner.lat,
+      maxLat: maxCorner.lat,
+      minLon: minCorner.lon,
+      maxLon: maxCorner.lon,
+    };
+
+    // Load each active dataset
+    for (const dataset of activeDatasets) {
+      if (!dataset.enabled) continue;
+      
+      try {
+        setDatasetLoading(dataset.id);
+        const geojson = await client.fetchDataset(dataset, bbox);
+        
+        if (geojson.features && geojson.features.length > 0) {
+          // Convert to Web Mercator
+          const mercatorGeoJson = convertGeoJSONToWebMercator(geojson);
+          
+          // Extract line vertices for rendering
+          const vertices: number[] = [];
+          
+          for (const feature of mercatorGeoJson.features) {
+            const { geometry } = feature;
+            
+            if (geometry.type === 'LineString') {
+              const coords = geometry.coordinates as number[][];
+              for (let i = 0; i < coords.length - 1; i++) {
+                vertices.push(coords[i][0], coords[i][1]);
+                vertices.push(coords[i + 1][0], coords[i + 1][1]);
+              }
+            } else if (geometry.type === 'MultiLineString') {
+              const lines = geometry.coordinates as number[][][];
+              for (const line of lines) {
+                for (let i = 0; i < line.length - 1; i++) {
+                  vertices.push(line[i][0], line[i][1]);
+                  vertices.push(line[i + 1][0], line[i + 1][1]);
+                }
+              }
+            } else if (geometry.type === 'Polygon') {
+              const rings = geometry.coordinates as number[][][];
+              for (const ring of rings) {
+                for (let i = 0; i < ring.length - 1; i++) {
+                  vertices.push(ring[i][0], ring[i][1]);
+                  vertices.push(ring[i + 1][0], ring[i + 1][1]);
+                }
+              }
+            } else if (geometry.type === 'MultiPolygon') {
+              const polygons = geometry.coordinates as number[][][][];
+              for (const polygon of polygons) {
+                for (const ring of polygon) {
+                  for (let i = 0; i < ring.length - 1; i++) {
+                    vertices.push(ring[i][0], ring[i][1]);
+                    vertices.push(ring[i + 1][0], ring[i + 1][1]);
+                  }
+                }
+              }
+            } else if (geometry.type === 'Point') {
+              // Draw a small cross for points
+              const [x, y] = geometry.coordinates as number[];
+              const size = 5 / renderer.camera.zoom;
+              vertices.push(x - size, y, x + size, y);
+              vertices.push(x, y - size, x, y + size);
+            }
+          }
+          
+          renderer.setGeoJSONLayer(dataset.id, vertices, dataset.color);
+        }
+        
+        setDatasetLoading(null);
+        setDatasetError(null);
+      } catch (err) {
+        console.error(`Failed to load dataset ${dataset.name}:`, err);
+        setDatasetError(err instanceof Error ? err.message : 'Failed to load dataset');
+        setDatasetLoading(null);
+      }
+    }
+  }, [activeDatasets]);
+
+  // Trigger overlay data loading on camera change (debounced)
+  useEffect(() => {
+    if (loading || activeDatasets.length === 0) return;
+    
+    const timer = setTimeout(() => {
+      loadOverlayData();
+    }, 300); // Debounce 300ms
+    
+    return () => clearTimeout(timer);
+  }, [loading, activeDatasets, loadOverlayData]);
 
   // Handle resize
   useEffect(() => {
@@ -728,6 +880,74 @@ function App() {
     }, 10);
   }, []);
 
+  // Dataset management functions
+  const addRecipeDatasets = useCallback((recipe: Recipe) => {
+    setActiveDatasets(prev => {
+      const newDatasets = recipe.datasets.filter(
+        d => !prev.some(existing => existing.id === d.id)
+      );
+      return [...prev, ...newDatasets];
+    });
+    // Trigger immediate load
+    lastViewportRef.current = null;
+    loadOverlayData();
+  }, [loadOverlayData]);
+
+  const toggleDataset = useCallback((datasetId: string) => {
+    setActiveDatasets(prev => 
+      prev.map(d => d.id === datasetId ? { ...d, enabled: !d.enabled } : d)
+    );
+    
+    // If disabling, remove the layer
+    const dataset = activeDatasets.find(d => d.id === datasetId);
+    if (dataset?.enabled) {
+      rendererRef.current?.removeGeoJSONLayer(datasetId);
+    } else {
+      lastViewportRef.current = null;
+      loadOverlayData();
+    }
+  }, [activeDatasets, loadOverlayData]);
+
+  const removeDataset = useCallback((datasetId: string) => {
+    setActiveDatasets(prev => prev.filter(d => d.id !== datasetId));
+    rendererRef.current?.removeGeoJSONLayer(datasetId);
+  }, []);
+
+  const addCustomDataset = useCallback(() => {
+    if (!customDatasetUrl.trim()) {
+      setDatasetError('Please enter a dataset URL');
+      return;
+    }
+
+    const parsed = parseDatasetUrl(customDatasetUrl);
+    if (!parsed) {
+      setDatasetError('Invalid dataset URL format');
+      return;
+    }
+
+    const newDataset: SocrataDataset = {
+      id: `custom-${Date.now()}`,
+      name: customDatasetName.trim() || `Custom: ${parsed.resourceId}`,
+      domain: parsed.domain,
+      resourceId: parsed.resourceId,
+      geometryColumn: 'the_geom',
+      color: customDatasetColor,
+      enabled: true,
+    };
+
+    setActiveDatasets(prev => [...prev, newDataset]);
+    setCustomDatasetUrl('');
+    setCustomDatasetName('');
+    setDatasetError(null);
+    
+    // Trigger load
+    lastViewportRef.current = null;
+    loadOverlayData();
+  }, [customDatasetUrl, customDatasetName, customDatasetColor, loadOverlayData]);
+
+  // Dummy function for setIsDrawingLasso (not used anymore but referenced)
+  const setIsDrawingLasso = useCallback((_: boolean) => {}, []);
+
   if (error) {
     return (
       <div className="error-overlay">
@@ -908,6 +1128,112 @@ function App() {
             ) : (
               <button onClick={computeStatistics}>Compute Statistics</button>
             )}
+          </div>
+        )}
+      </div>
+
+      {/* Recipes Panel (left side) */}
+      <div className={`recipes-panel ${showRecipesPanel ? 'open' : ''}`}>
+        <button 
+          className="recipes-toggle"
+          onClick={() => setShowRecipesPanel(!showRecipesPanel)}
+        >
+          Data {showRecipesPanel ? '◀' : '▶'}
+        </button>
+
+        {showRecipesPanel && (
+          <div className="recipes-content">
+            <h3>Data Layers</h3>
+            
+            {/* Zoom warning */}
+            {rendererRef.current && rendererRef.current.camera.zoom < OVERLAY_ZOOM_THRESHOLD && (
+              <div className="zoom-warning">
+                ⚠️ Zoom in further to load overlay data
+              </div>
+            )}
+
+            {/* Active Datasets */}
+            {activeDatasets.length > 0 && (
+              <div className="active-datasets">
+                <h4>Active Layers</h4>
+                {activeDatasets.map(dataset => (
+                  <div key={dataset.id} className="dataset-item">
+                    <button
+                      className={`dataset-toggle ${dataset.enabled ? 'enabled' : ''}`}
+                      onClick={() => toggleDataset(dataset.id)}
+                      style={{ borderLeftColor: dataset.color }}
+                    >
+                      <span className="dataset-checkbox">
+                        {dataset.enabled ? '☑' : '☐'}
+                      </span>
+                      <span className="dataset-name">{dataset.name}</span>
+                      {datasetLoading === dataset.id && (
+                        <span className="loading-indicator">⋯</span>
+                      )}
+                    </button>
+                    <button
+                      className="dataset-remove"
+                      onClick={() => removeDataset(dataset.id)}
+                      title="Remove layer"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Recipes */}
+            <div className="recipes-list">
+              <h4>Recipes</h4>
+              {RECIPES.map(recipe => (
+                <div key={recipe.id} className="recipe-item">
+                  <button
+                    className="recipe-btn"
+                    onClick={() => addRecipeDatasets(recipe)}
+                    disabled={recipe.datasets.every(d => 
+                      activeDatasets.some(a => a.id === d.id)
+                    )}
+                  >
+                    <span className="recipe-name">{recipe.name}</span>
+                    <small className="recipe-desc">{recipe.description}</small>
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            {/* Custom Dataset */}
+            <div className="custom-dataset">
+              <h4>Add Custom Dataset</h4>
+              <input
+                type="text"
+                placeholder="Dataset name (optional)"
+                value={customDatasetName}
+                onChange={e => setCustomDatasetName(e.target.value)}
+              />
+              <input
+                type="text"
+                placeholder="Socrata URL or resource ID"
+                value={customDatasetUrl}
+                onChange={e => {
+                  setCustomDatasetUrl(e.target.value);
+                  setDatasetError(null);
+                }}
+              />
+              <div className="color-picker-row">
+                <label>Color:</label>
+                <input
+                  type="color"
+                  value={customDatasetColor}
+                  onChange={e => setCustomDatasetColor(e.target.value)}
+                />
+              </div>
+              <button onClick={addCustomDataset}>Add Dataset</button>
+              
+              {datasetError && (
+                <div className="dataset-error">{datasetError}</div>
+              )}
+            </div>
           </div>
         )}
       </div>
