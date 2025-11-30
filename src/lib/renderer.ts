@@ -301,17 +301,69 @@ struct Camera {
 
 struct OverlayParams {
   color: vec4f,
+  lineWidth: f32,
+  _pad1: f32,
+  _pad2: f32,
+  _pad3: f32,
 };
 
 @group(0) @binding(1) var<uniform> params: OverlayParams;
 
+// Each line segment: p0, p1 (4 floats total)
+// We use instance rendering: 6 vertices per line segment (2 triangles = quad)
 struct VertexInput {
-  @location(0) position: vec2f,
+  @location(0) p0: vec2f,
+  @location(1) p1: vec2f,
+  @builtin(vertex_index) vertexIndex: u32,
+};
+
+struct VertexOutput {
+  @builtin(position) position: vec4f,
 };
 
 @vertex
-fn vs_main(input: VertexInput) -> @builtin(position) vec4f {
-  return camera.projection * camera.view * vec4f(input.position, 0.0, 1.0);
+fn vs_main(input: VertexInput) -> VertexOutput {
+  var output: VertexOutput;
+  
+  // Transform to clip space
+  let clip0 = camera.projection * camera.view * vec4f(input.p0, 0.0, 1.0);
+  let clip1 = camera.projection * camera.view * vec4f(input.p1, 0.0, 1.0);
+  
+  // Convert to screen space
+  let screen0 = clip0.xy / clip0.w * camera.viewport * 0.5;
+  let screen1 = clip1.xy / clip1.w * camera.viewport * 0.5;
+  
+  // Line direction and perpendicular
+  let dir = normalize(screen1 - screen0);
+  let perp = vec2f(-dir.y, dir.x);
+  
+  // Half width in pixels
+  let halfWidth = params.lineWidth * 0.5;
+  
+  // Quad vertices (2 triangles)
+  // 0--2  4
+  // | / / |
+  // 1  3--5
+  var screenPos: vec2f;
+  let idx = input.vertexIndex % 6u;
+  if (idx == 0u) {
+    screenPos = screen0 + perp * halfWidth;
+  } else if (idx == 1u) {
+    screenPos = screen0 - perp * halfWidth;
+  } else if (idx == 2u) {
+    screenPos = screen1 + perp * halfWidth;
+  } else if (idx == 3u) {
+    screenPos = screen0 - perp * halfWidth;
+  } else if (idx == 4u) {
+    screenPos = screen1 + perp * halfWidth;
+  } else {
+    screenPos = screen1 - perp * halfWidth;
+  }
+  
+  // Convert back to clip space
+  output.position = vec4f(screenPos / camera.viewport * 2.0, 0.0, 1.0);
+  
+  return output;
 }
 
 @fragment
@@ -570,7 +622,7 @@ export class WebGPURenderer {
     this.geojsonBindGroupLayout = this.device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
-        { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
       ],
     });
 
@@ -583,9 +635,11 @@ export class WebGPURenderer {
         module: geojsonModule,
         entryPoint: 'vs_main',
         buffers: [{
-          arrayStride: 8, // vec2f
+          arrayStride: 16, // vec2f p0 + vec2f p1 per line segment (instanced)
+          stepMode: 'instance',
           attributes: [
-            { shaderLocation: 0, offset: 0, format: 'float32x2' },
+            { shaderLocation: 0, offset: 0, format: 'float32x2' },  // p0
+            { shaderLocation: 1, offset: 8, format: 'float32x2' },  // p1
           ],
         }],
       },
@@ -600,7 +654,7 @@ export class WebGPURenderer {
           },
         }],
       },
-      primitive: { topology: 'line-list' },
+      primitive: { topology: 'triangle-list' },
     });
   }
 
@@ -960,14 +1014,15 @@ export class WebGPURenderer {
       renderPass.draw(2);
     }
 
-    // Draw GeoJSON overlay layers
+    // Draw GeoJSON overlay layers (instanced thick lines)
     if (this.geojsonPipeline) {
       renderPass.setPipeline(this.geojsonPipeline);
       for (const layer of this.geojsonLayers.values()) {
         if (layer.vertexBuffer && layer.bindGroup && layer.vertexCount > 0) {
           renderPass.setBindGroup(0, layer.bindGroup);
           renderPass.setVertexBuffer(0, layer.vertexBuffer);
-          renderPass.draw(layer.vertexCount);
+          // 6 vertices per line segment (2 triangles = quad), instanceCount = number of line segments
+          renderPass.draw(6, layer.vertexCount);
         }
       }
     }
@@ -1069,7 +1124,7 @@ export class WebGPURenderer {
    * @param vertices Array of [x, y] Web Mercator coordinates (line segments: [x1,y1,x2,y2,...])
    * @param color Hex color string
    */
-  public setGeoJSONLayer(id: string, vertices: number[], color: string): void {
+  public setGeoJSONLayer(id: string, vertices: number[], color: string, lineWidth: number = 3.0): void {
     if (!this.device || !this.uniformBuffer || !this.geojsonBindGroupLayout) return;
 
     // Clean up existing layer
@@ -1085,13 +1140,14 @@ export class WebGPURenderer {
     }
 
     // Adjust coordinates relative to world center
+    // vertices is already in line segment format: [x0, y0, x1, y1, x0, y0, x1, y1, ...]
     const adjustedVertices = new Float32Array(vertices.length);
     for (let i = 0; i < vertices.length; i += 2) {
       adjustedVertices[i] = vertices[i] - this.worldCenterX;
       adjustedVertices[i + 1] = vertices[i + 1] - this.worldCenterY;
     }
 
-    // Create vertex buffer
+    // Create vertex buffer (each line segment is 4 floats: p0.x, p0.y, p1.x, p1.y)
     const vertexBuffer = this.device.createBuffer({
       size: adjustedVertices.byteLength,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
@@ -1100,14 +1156,14 @@ export class WebGPURenderer {
     new Float32Array(vertexBuffer.getMappedRange()).set(adjustedVertices);
     vertexBuffer.unmap();
 
-    // Create params buffer for color
+    // Create params buffer for color + lineWidth
     const rgba = this.hexToRgba(color);
     const paramsBuffer = this.device.createBuffer({
-      size: 16, // vec4f
+      size: 32, // vec4f color + f32 lineWidth + 3x f32 padding
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       mappedAtCreation: true,
     });
-    new Float32Array(paramsBuffer.getMappedRange()).set(rgba);
+    new Float32Array(paramsBuffer.getMappedRange()).set([...rgba, lineWidth, 0, 0, 0]);
     paramsBuffer.unmap();
 
     // Create bind group
@@ -1119,11 +1175,14 @@ export class WebGPURenderer {
       ],
     });
 
+    // Each line segment is 4 floats, so number of line segments = vertices.length / 4
+    const lineSegmentCount = vertices.length / 4;
+
     this.geojsonLayers.set(id, {
       id,
       color,
       vertexBuffer,
-      vertexCount: vertices.length / 2,
+      vertexCount: lineSegmentCount, // Now counts line segments, not vertices
       paramsBuffer,
       bindGroup,
     });
