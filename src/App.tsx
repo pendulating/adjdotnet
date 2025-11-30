@@ -6,7 +6,6 @@ import { DuckDBLayer } from './lib/duckdb';
 import { TILE_PROVIDERS, CUSTOM_TILE_PROVIDERS } from './lib/tile-layer';
 import type { EditorMode, Selection, Point } from './lib/editor-state';
 import {
-  EDITOR_MODES,
   createEmptySelection,
   toggleNodeSelection,
   toggleEdgeSelection,
@@ -20,41 +19,26 @@ import {
   findNodesInPolygon,
   simplifyPath,
 } from './lib/editor-state';
+
+// Components
 import {
-  SocrataClient,
-  RECIPES,
-  webMercatorToLatLon,
-  convertGeoJSONToWebMercator,
-  parseDatasetUrl,
-} from './lib/socrata';
-import type { SocrataDataset, Recipe } from './lib/socrata';
+  Toolbar,
+  Controls,
+  BasemapSelector,
+  StatusBar,
+  AnalysisPanel,
+  DataLayersPanel,
+} from './components';
+import type { GraphStatistics } from './components';
+
+// Hooks
+import { useDataLayers, useCamera } from './hooks';
 
 interface NetworkMetadata {
   center_x: number;
   center_y: number;
   crs: string;
 }
-
-interface GraphStatistics {
-  nodeCount: number;
-  edgeCount: number;
-  numComponents: number;
-  giantComponentSize: number;
-  giantComponentPercent: number;
-  avgDegree: number;
-  isolatedNodes: number;
-}
-
-const BASEMAP_OPTIONS = [
-  { id: 'cartoDark', label: 'Dark' },
-  { id: 'cartoLight', label: 'Light' },
-  { id: 'cartoVoyager', label: 'Voyager' },
-  { id: 'osm', label: 'OpenStreetMap' },
-] as const;
-
-const CUSTOM_BASEMAP_OPTIONS = [
-  { id: 'nycOrthos2024', label: 'NYC 2024 Satellite' },
-] as const;
 
 // Hit detection threshold in pixels
 const HIT_THRESHOLD_PX = 12;
@@ -81,36 +65,11 @@ function App() {
   // Analysis state
   const [showAnalysisPanel, setShowAnalysisPanel] = useState(false);
   const [graphStats, setGraphStats] = useState<GraphStatistics | null>(null);
-  const [colorMode, setColorModeState] = useState<0 | 1 | 2>(0); // 0=none, 1=all components, 2=highlight giant
+  const [colorMode, setColorModeState] = useState<0 | 1 | 2>(0);
   const [isComputing, setIsComputing] = useState(false);
 
-  // Socrata/Recipes state
+  // Data layers panel state
   const [showRecipesPanel, setShowRecipesPanel] = useState(false);
-  const [activeDatasets, setActiveDatasets] = useState<SocrataDataset[]>([]);
-  const [customDatasetUrl, setCustomDatasetUrl] = useState('');
-  const [customDatasetName, setCustomDatasetName] = useState('');
-  const [customDatasetColor, setCustomDatasetColor] = useState('#22c55e');
-  const [datasetLoading, setDatasetLoading] = useState<string | null>(null);
-  const [datasetError, setDatasetError] = useState<string | null>(null);
-  const socrataClientRef = useRef<SocrataClient | null>(null);
-  const lastViewportRef = useRef<{ minX: number; minY: number; maxX: number; maxY: number } | null>(null);
-
-  // Zoom threshold for loading overlay data (zoom level where we load datasets)
-  const OVERLAY_ZOOM_THRESHOLD = 0.5;
-
-  // Camera change tracking for overlay data loading
-  const [cameraVersion, setCameraVersion] = useState(0);
-  const cameraChangeTimeout = useRef<number | null>(null);
-
-  // Debounced camera change notification
-  const notifyCameraChange = useCallback(() => {
-    if (cameraChangeTimeout.current) {
-      clearTimeout(cameraChangeTimeout.current);
-    }
-    cameraChangeTimeout.current = window.setTimeout(() => {
-      setCameraVersion(v => v + 1);
-    }, 300);
-  }, []);
 
   // Drag state
   const isDragging = useRef(false);
@@ -123,10 +82,32 @@ function App() {
   const isDrawingLassoRef = useRef(false);
   const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
 
+  // Camera hook
+  const { cameraVersion, pan, zoomAt, resetView } = useCamera({
+    renderer: rendererRef.current,
+  });
+
+  // Data layers hook
+  const {
+    activeDatasets,
+    datasetLoading,
+    datasetError,
+    showZoomWarning,
+    addRecipeDatasets,
+    toggleDataset,
+    removeDataset,
+    addCustomDataset,
+    clearError,
+  } = useDataLayers({
+    renderer: rendererRef.current,
+    loading,
+    cameraVersion,
+  });
+
   // Initialize
   useEffect(() => {
     let cancelled = false;
-    
+
     async function init() {
       try {
         const metaRes = await fetch('/data/network_metadata.json');
@@ -136,7 +117,7 @@ function App() {
 
         const db = DuckDBLayer.getInstance();
         await db.init();
-        
+
         if (cancelled) return;
 
         await db.loadParquet('/data/nodes.parquet', 'nodes');
@@ -147,7 +128,7 @@ function App() {
         const graph = new GraphState();
         const nodesResult = await db.query('SELECT * FROM nodes');
         const edgesResult = await db.query('SELECT * FROM edges');
-        
+
         graph.loadFromArrow(nodesResult, edgesResult);
         graphRef.current = graph;
 
@@ -160,7 +141,7 @@ function App() {
           console.error('Canvas not ready');
           return;
         }
-        
+
         const dpr = window.devicePixelRatio || 1;
         const rect = canvas.getBoundingClientRect();
         canvas.width = rect.width * dpr;
@@ -168,7 +149,7 @@ function App() {
 
         const renderer = new WebGPURenderer(canvas, graph);
         renderer.setWorldCenter(metadata.center_x, metadata.center_y);
-        
+
         await renderer.init();
 
         if (cancelled) {
@@ -183,10 +164,6 @@ function App() {
         });
 
         rendererRef.current = renderer;
-        
-        // Initialize Socrata client
-        socrataClientRef.current = new SocrataClient();
-        
         setLoading(false);
 
       } catch (e) {
@@ -231,7 +208,6 @@ function App() {
     const renderer = rendererRef.current;
     if (!overlayCanvas || !mainCanvas || !renderer) return;
 
-    // Match overlay canvas size to main canvas
     const rect = mainCanvas.getBoundingClientRect();
     overlayCanvas.width = rect.width;
     overlayCanvas.height = rect.height;
@@ -239,44 +215,36 @@ function App() {
     const ctx = overlayCanvas.getContext('2d');
     if (!ctx) return;
 
-    // Clear canvas
     ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
 
-    // Draw polygon/lasso if we have points
     if (polygonPoints.length < 2) return;
 
-    // Convert world coordinates to screen coordinates
     const dpr = window.devicePixelRatio || 1;
     const screenPoints = polygonPoints.map(p => {
       const screen = renderer.worldToScreen(p.x, p.y);
       return { x: screen.x / dpr, y: screen.y / dpr };
     });
 
-    // Draw the polygon path
     ctx.beginPath();
     ctx.moveTo(screenPoints[0].x, screenPoints[0].y);
     for (let i = 1; i < screenPoints.length; i++) {
       ctx.lineTo(screenPoints[i].x, screenPoints[i].y);
     }
 
-    // Close the path for filling (both polygon and lasso)
     if (polygonPoints.length >= 3) {
       ctx.closePath();
     }
 
-    // Fill with semi-transparent color
-    ctx.fillStyle = mode === 'lassoSelect' 
-      ? 'rgba(34, 197, 94, 0.2)'  // Green for lasso
-      : 'rgba(59, 130, 246, 0.15)'; // Blue for polygon
+    ctx.fillStyle = mode === 'lassoSelect'
+      ? 'rgba(34, 197, 94, 0.2)'
+      : 'rgba(59, 130, 246, 0.15)';
     ctx.fill();
 
-    // Stroke the outline
     ctx.strokeStyle = mode === 'lassoSelect' ? '#22c55e' : '#3b82f6';
     ctx.lineWidth = 2;
     ctx.setLineDash(mode === 'polygonSelect' ? [5, 5] : []);
     ctx.stroke();
 
-    // Draw vertices for polygon mode
     if (mode === 'polygonSelect') {
       ctx.fillStyle = '#3b82f6';
       for (const p of screenPoints) {
@@ -286,127 +254,6 @@ function App() {
       }
     }
   }, [polygonPoints, mode]);
-
-  // Load overlay data for active datasets when zoomed in
-  const loadOverlayData = useCallback(async () => {
-    const renderer = rendererRef.current;
-    const client = socrataClientRef.current;
-    if (!renderer || !client || activeDatasets.length === 0) return;
-
-    const zoom = renderer.camera.zoom;
-    if (zoom < OVERLAY_ZOOM_THRESHOLD) {
-      // Too zoomed out, clear overlay layers
-      for (const dataset of activeDatasets) {
-        renderer.removeGeoJSONLayer(dataset.id);
-      }
-      return;
-    }
-
-    const bounds = renderer.getViewportBounds();
-    
-    // Check if viewport has changed significantly
-    const last = lastViewportRef.current;
-    if (last) {
-      const threshold = 100; // meters
-      if (
-        Math.abs(bounds.minX - last.minX) < threshold &&
-        Math.abs(bounds.maxX - last.maxX) < threshold &&
-        Math.abs(bounds.minY - last.minY) < threshold &&
-        Math.abs(bounds.maxY - last.maxY) < threshold
-      ) {
-        return; // Viewport hasn't changed enough
-      }
-    }
-    lastViewportRef.current = bounds;
-
-    // Convert Web Mercator bounds to lat/lon for Socrata query
-    const minCorner = webMercatorToLatLon(bounds.minX, bounds.minY);
-    const maxCorner = webMercatorToLatLon(bounds.maxX, bounds.maxY);
-    
-    const bbox = {
-      minLat: minCorner.lat,
-      maxLat: maxCorner.lat,
-      minLon: minCorner.lon,
-      maxLon: maxCorner.lon,
-    };
-
-    // Load each active dataset
-    for (const dataset of activeDatasets) {
-      if (!dataset.enabled) continue;
-      
-      try {
-        setDatasetLoading(dataset.id);
-        const geojson = await client.fetchDataset(dataset, bbox);
-        
-        if (geojson.features && geojson.features.length > 0) {
-          // Convert to Web Mercator
-          const mercatorGeoJson = convertGeoJSONToWebMercator(geojson);
-          
-          // Extract line vertices for rendering
-          const vertices: number[] = [];
-          
-          for (const feature of mercatorGeoJson.features) {
-            const { geometry } = feature;
-            
-            if (geometry.type === 'LineString') {
-              const coords = geometry.coordinates as number[][];
-              for (let i = 0; i < coords.length - 1; i++) {
-                vertices.push(coords[i][0], coords[i][1]);
-                vertices.push(coords[i + 1][0], coords[i + 1][1]);
-              }
-            } else if (geometry.type === 'MultiLineString') {
-              const lines = geometry.coordinates as number[][][];
-              for (const line of lines) {
-                for (let i = 0; i < line.length - 1; i++) {
-                  vertices.push(line[i][0], line[i][1]);
-                  vertices.push(line[i + 1][0], line[i + 1][1]);
-                }
-              }
-            } else if (geometry.type === 'Polygon') {
-              const rings = geometry.coordinates as number[][][];
-              for (const ring of rings) {
-                for (let i = 0; i < ring.length - 1; i++) {
-                  vertices.push(ring[i][0], ring[i][1]);
-                  vertices.push(ring[i + 1][0], ring[i + 1][1]);
-                }
-              }
-            } else if (geometry.type === 'MultiPolygon') {
-              const polygons = geometry.coordinates as number[][][][];
-              for (const polygon of polygons) {
-                for (const ring of polygon) {
-                  for (let i = 0; i < ring.length - 1; i++) {
-                    vertices.push(ring[i][0], ring[i][1]);
-                    vertices.push(ring[i + 1][0], ring[i + 1][1]);
-                  }
-                }
-              }
-            } else if (geometry.type === 'Point') {
-              // Draw a small cross for points
-              const [x, y] = geometry.coordinates as number[];
-              const size = 5 / renderer.camera.zoom;
-              vertices.push(x - size, y, x + size, y);
-              vertices.push(x, y - size, x, y + size);
-            }
-          }
-          
-          renderer.setGeoJSONLayer(dataset.id, vertices, dataset.color);
-        }
-        
-        setDatasetLoading(null);
-        setDatasetError(null);
-      } catch (err) {
-        console.error(`Failed to load dataset ${dataset.name}:`, err);
-        setDatasetError(err instanceof Error ? err.message : 'Failed to load dataset');
-        setDatasetLoading(null);
-      }
-    }
-  }, [activeDatasets]);
-
-  // Trigger overlay data loading on camera change
-  useEffect(() => {
-    if (loading || activeDatasets.length === 0) return;
-    loadOverlayData();
-  }, [loading, activeDatasets, loadOverlayData, cameraVersion]);
 
   // Handle resize
   useEffect(() => {
@@ -425,10 +272,8 @@ function App() {
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Don't handle if focused on input
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
 
-      // Mode shortcuts
       if (!e.ctrlKey && !e.metaKey) {
         switch (e.key.toLowerCase()) {
           case 'v': setMode('pan'); setPolygonPoints([]); return;
@@ -442,11 +287,9 @@ function App() {
             setSelection(createEmptySelection());
             setPendingEdgeSource(null);
             setPolygonPoints([]);
-            setIsDrawingLasso(false);
             rendererRef.current?.setPreviewEdge(false);
             return;
           case 'enter':
-            // Complete polygon selection
             if (mode === 'polygonSelect' && polygonPoints.length >= 3) {
               completePolygonSelection(e.shiftKey);
             }
@@ -458,7 +301,6 @@ function App() {
         }
       }
 
-      // Undo/Redo
       if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
         e.preventDefault();
         if (e.shiftKey) {
@@ -475,7 +317,7 @@ function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selection]);
+  }, [selection, mode, polygonPoints]);
 
   // Hit testing
   const hitTest = useCallback((screenX: number, screenY: number): { type: 'node' | 'edge' | 'none'; idx: number } => {
@@ -486,13 +328,11 @@ function App() {
     const world = renderer.screenToWorld(screenX, screenY);
     const hitRadiusWorld = HIT_THRESHOLD_PX / renderer.camera.zoom;
 
-    // Check nodes first (they're on top)
     const nearestNode = graph.findNearestNode(world.x, world.y, hitRadiusWorld);
     if (nearestNode >= 0) {
       return { type: 'node', idx: nearestNode };
     }
 
-    // Then check edges
     const nearestEdge = graph.findNearestEdge(world.x, world.y, hitRadiusWorld);
     if (nearestEdge >= 0) {
       return { type: 'edge', idx: nearestEdge };
@@ -529,7 +369,6 @@ function App() {
           const newSelection = toggleNodeSelection(selection, hit.idx, e.shiftKey);
           setSelection(newSelection);
 
-          // Start drag if clicking on a selected node
           if (newSelection.nodes.has(hit.idx)) {
             isDragging.current = true;
             draggedNodes.current.clear();
@@ -543,7 +382,6 @@ function App() {
         } else if (hit.type === 'edge') {
           setSelection(toggleEdgeSelection(selection, hit.idx, e.shiftKey));
         } else {
-          // Click on empty space - start box selection or clear
           if (!e.shiftKey) {
             setSelection(createEmptySelection());
           }
@@ -565,11 +403,9 @@ function App() {
         const hit = hitTest(screenX, screenY);
         if (hit.type === 'node') {
           if (pendingEdgeSource === null) {
-            // First click - select source
             setPendingEdgeSource(hit.idx);
             setSelection({ nodes: new Set([hit.idx]), edges: new Set() });
           } else if (hit.idx !== pendingEdgeSource) {
-            // Second click - create edge
             const cmd = new AddEdgeCommand(graph, pendingEdgeSource, hit.idx);
             commandHistoryRef.current.execute(cmd);
             const newEdgeIdx = cmd.getEdgeIdx();
@@ -581,7 +417,6 @@ function App() {
             updateStats();
           }
         } else {
-          // Click on empty space - cancel
           setPendingEdgeSource(null);
           renderer.setPreviewEdge(false);
         }
@@ -605,18 +440,15 @@ function App() {
       }
 
       case 'polygonSelect': {
-        // Double-click to close polygon
         if (e.detail === 2 && polygonPoints.length >= 3) {
           completePolygonSelection(e.shiftKey);
         } else {
-          // Add point to polygon
           setPolygonPoints(prev => [...prev, world]);
         }
         break;
       }
 
       case 'lassoSelect': {
-        // Start lasso drawing
         isDrawingLassoRef.current = true;
         setPolygonPoints([world]);
         break;
@@ -637,14 +469,12 @@ function App() {
     const screenY = (e.clientY - rect.top) * dpr;
     const world = renderer.screenToWorld(screenX, screenY);
 
-    // Preview edge in addEdge mode
     if (mode === 'addEdge' && pendingEdgeSource !== null) {
       const srcX = graph.nodeX[pendingEdgeSource];
       const srcY = graph.nodeY[pendingEdgeSource];
       renderer.setPreviewEdge(true, srcX, srcY, world.x, world.y);
     }
 
-    // Lasso drawing - handle before isDragging check since it uses its own ref
     if (mode === 'lassoSelect' && isDrawingLassoRef.current) {
       setPolygonPoints(prev => [...prev, world]);
       return;
@@ -657,13 +487,11 @@ function App() {
 
     switch (mode) {
       case 'pan':
-        renderer.pan(dx, dy);
+        pan(dx, dy);
         dragStartScreen.current = { x: e.clientX, y: e.clientY };
-        notifyCameraChange();
         break;
 
       case 'select':
-        // Drag selected nodes
         if (draggedNodes.current.size > 0) {
           const deltaX = world.x - dragStartWorld.current.x;
           const deltaY = world.y - dragStartWorld.current.y;
@@ -674,12 +502,11 @@ function App() {
         }
         break;
     }
-  }, [mode, pendingEdgeSource, notifyCameraChange]);
+  }, [mode, pendingEdgeSource, pan]);
 
   const handleMouseUp = useCallback((e: React.MouseEvent) => {
     const graph = graphRef.current;
 
-    // Finalize node drag as a command
     if (mode === 'select' && isDragging.current && draggedNodes.current.size > 0 && graph) {
       const dpr = window.devicePixelRatio || 1;
       const rect = canvasRef.current?.getBoundingClientRect();
@@ -688,18 +515,14 @@ function App() {
         const screenY = (e.clientY - rect.top) * dpr;
         const world = rendererRef.current.screenToWorld(screenX, screenY);
 
-        // Check if actually moved
         const movedDistance = Math.hypot(
           world.x - dragStartWorld.current.x,
           world.y - dragStartWorld.current.y
         );
 
         if (movedDistance > 1) {
-          // Create move commands for all dragged nodes
-          // For simplicity, we create individual commands (could optimize to batch)
           for (const [nodeIdx, start] of draggedNodes.current) {
             const cmd = new MoveNodeCommand(graph, nodeIdx, graph.nodeX[nodeIdx], graph.nodeY[nodeIdx]);
-            // Override the old position for correct undo
             (cmd as any).oldX = start.startX;
             (cmd as any).oldY = start.startY;
             commandHistoryRef.current.execute(cmd);
@@ -709,7 +532,6 @@ function App() {
       }
     }
 
-    // Complete lasso selection
     if (mode === 'lassoSelect' && isDrawingLassoRef.current && polygonPoints.length >= 3) {
       completeLassoSelection(e.shiftKey);
     }
@@ -722,24 +544,18 @@ function App() {
   const handleWheel = useCallback((e: React.WheelEvent) => {
     if (!rendererRef.current) return;
     e.preventDefault();
-    
+
     const rect = canvasRef.current?.getBoundingClientRect();
     if (!rect) return;
 
     const x = (e.clientX - rect.left) * (window.devicePixelRatio || 1);
     const y = (e.clientY - rect.top) * (window.devicePixelRatio || 1);
-    
+
     const factor = e.deltaY > 0 ? 0.9 : 1.1;
-    rendererRef.current.zoomAt(x, y, factor);
-    notifyCameraChange();
-  }, [notifyCameraChange]);
+    zoomAt(x, y, factor);
+  }, [zoomAt]);
 
   // Actions
-  const resetView = useCallback(() => {
-    rendererRef.current?.setCamera(0, 0, 0.1);
-    notifyCameraChange();
-  }, [notifyCameraChange]);
-
   const toggleBasemap = useCallback(() => {
     setBasemapEnabled(prev => {
       const next = !prev;
@@ -750,8 +566,7 @@ function App() {
 
   const changeBasemapStyle = useCallback((styleId: string) => {
     setBasemapStyle(styleId);
-    // Check both standard and custom providers
-    const provider = TILE_PROVIDERS[styleId as keyof typeof TILE_PROVIDERS] 
+    const provider = TILE_PROVIDERS[styleId as keyof typeof TILE_PROVIDERS]
       || CUSTOM_TILE_PROVIDERS[styleId as keyof typeof CUSTOM_TILE_PROVIDERS];
     if (provider && rendererRef.current) {
       rendererRef.current.setTileProvider(provider);
@@ -788,6 +603,14 @@ function App() {
     }
   }, [updateStats]);
 
+  // Mode change handler
+  const handleModeChange = useCallback((newMode: EditorMode) => {
+    setMode(newMode);
+    if (newMode !== 'addEdge') setPendingEdgeSource(null);
+    setPolygonPoints([]);
+    rendererRef.current?.setPreviewEdge(false);
+  }, []);
+
   // Cursor based on mode and state
   const getCursor = useCallback(() => {
     if (isDragging.current) {
@@ -820,10 +643,9 @@ function App() {
     const graph = graphRef.current;
     if (!graph || polygonPoints.length < 3) return;
 
-    // Simplify the lasso path for performance
     const minDist = 10 / (rendererRef.current?.camera.zoom || 1);
     const simplified = simplifyPath(polygonPoints, minDist);
-    
+
     if (simplified.length >= 3) {
       const nodesInLasso = findNodesInPolygon(graph, simplified);
       setSelection(selectNodes(selection, nodesInLasso, addToSelection));
@@ -835,9 +657,8 @@ function App() {
   const computeStatistics = useCallback(() => {
     const graph = graphRef.current;
     if (!graph) return;
-    
+
     setIsComputing(true);
-    // Use setTimeout to not block UI
     setTimeout(() => {
       const stats = graph.computeStatistics();
       setGraphStats(stats);
@@ -898,74 +719,6 @@ function App() {
     }, 10);
   }, []);
 
-  // Dataset management functions
-  const addRecipeDatasets = useCallback((recipe: Recipe) => {
-    setActiveDatasets(prev => {
-      const newDatasets = recipe.datasets.filter(
-        d => !prev.some(existing => existing.id === d.id)
-      );
-      return [...prev, ...newDatasets];
-    });
-    // Trigger immediate load
-    lastViewportRef.current = null;
-    loadOverlayData();
-  }, [loadOverlayData]);
-
-  const toggleDataset = useCallback((datasetId: string) => {
-    setActiveDatasets(prev => 
-      prev.map(d => d.id === datasetId ? { ...d, enabled: !d.enabled } : d)
-    );
-    
-    // If disabling, remove the layer
-    const dataset = activeDatasets.find(d => d.id === datasetId);
-    if (dataset?.enabled) {
-      rendererRef.current?.removeGeoJSONLayer(datasetId);
-    } else {
-      lastViewportRef.current = null;
-      loadOverlayData();
-    }
-  }, [activeDatasets, loadOverlayData]);
-
-  const removeDataset = useCallback((datasetId: string) => {
-    setActiveDatasets(prev => prev.filter(d => d.id !== datasetId));
-    rendererRef.current?.removeGeoJSONLayer(datasetId);
-  }, []);
-
-  const addCustomDataset = useCallback(() => {
-    if (!customDatasetUrl.trim()) {
-      setDatasetError('Please enter a dataset URL');
-      return;
-    }
-
-    const parsed = parseDatasetUrl(customDatasetUrl);
-    if (!parsed) {
-      setDatasetError('Invalid dataset URL format');
-      return;
-    }
-
-    const newDataset: SocrataDataset = {
-      id: `custom-${Date.now()}`,
-      name: customDatasetName.trim() || `Custom: ${parsed.resourceId}`,
-      domain: parsed.domain,
-      resourceId: parsed.resourceId,
-      geometryColumn: 'the_geom',
-      color: customDatasetColor,
-      enabled: true,
-    };
-
-    setActiveDatasets(prev => [...prev, newDataset]);
-    setCustomDatasetUrl('');
-    setCustomDatasetName('');
-    setDatasetError(null);
-    
-    // Trigger load
-    lastViewportRef.current = null;
-    loadOverlayData();
-  }, [customDatasetUrl, customDatasetName, customDatasetColor, loadOverlayData]);
-
-  // Dummy function for setIsDrawingLasso (not used anymore but referenced)
-  const setIsDrawingLasso = useCallback((_: boolean) => {}, []);
-
   if (error) {
     return (
       <div className="error-overlay">
@@ -983,320 +736,71 @@ function App() {
           <h2>Loading network data...</h2>
         </div>
       )}
-      
+
       <div className="overlay">
         <h1>Network Inspector</h1>
         {!loading && (
           <>
-            {/* Mode toolbar */}
-            <div className="toolbar">
-              {EDITOR_MODES.map(m => (
-                <button
-                  key={m.id}
-                  onClick={() => {
-                    setMode(m.id);
-                    if (m.id !== 'addEdge') setPendingEdgeSource(null);
-                    setPolygonPoints([]);
-                    setIsDrawingLasso(false);
-                    rendererRef.current?.setPreviewEdge(false);
-                  }}
-                  className={mode === m.id ? 'active' : ''}
-                  title={`${m.label} (${m.shortcut})`}
-                >
-                  <span className="icon">{m.icon}</span>
-                  <span className="label">{m.label}</span>
-                </button>
-              ))}
-            </div>
+            <Toolbar mode={mode} onModeChange={handleModeChange} />
 
-            {/* Action buttons */}
-            <div className="controls">
-              <button onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z)">
-                ↶ Undo
-              </button>
-              <button onClick={redo} disabled={!canRedo} title="Redo (Ctrl+Y)">
-                ↷ Redo
-              </button>
-              <button
-                onClick={deleteSelection}
-                disabled={selectionCount(selection) === 0}
-                title="Delete Selection (Del)"
-              >
-                🗑 Delete
-              </button>
-              <span className="separator" />
-              <button onClick={resetView}>Reset View</button>
-              <button 
-                onClick={toggleBasemap}
-                className={basemapEnabled ? 'active' : ''}
-              >
-                {basemapEnabled ? 'Hide Map' : 'Show Map'}
-              </button>
-            </div>
+            <Controls
+              canUndo={canUndo}
+              canRedo={canRedo}
+              canDelete={selectionCount(selection) > 0}
+              basemapEnabled={basemapEnabled}
+              onUndo={undo}
+              onRedo={redo}
+              onDelete={deleteSelection}
+              onResetView={resetView}
+              onToggleBasemap={toggleBasemap}
+            />
 
-            {/* Basemap selector */}
             {basemapEnabled && (
-              <>
-                <div className="basemap-selector">
-                  {BASEMAP_OPTIONS.map(opt => (
-                    <button
-                      key={opt.id}
-                      onClick={() => changeBasemapStyle(opt.id)}
-                      className={basemapStyle === opt.id ? 'active' : ''}
-                    >
-                      {opt.label}
-                    </button>
-                  ))}
-                </div>
-                
-                {/* Custom basemaps */}
-                <div className="basemap-selector custom-basemaps">
-                  <span className="basemap-label">Custom:</span>
-                  {CUSTOM_BASEMAP_OPTIONS.map(opt => (
-                    <button
-                      key={opt.id}
-                      onClick={() => changeBasemapStyle(opt.id)}
-                      className={basemapStyle === opt.id ? 'active satellite' : ''}
-                    >
-                      {opt.label}
-                    </button>
-                  ))}
-                </div>
-              </>
+              <BasemapSelector
+                currentStyle={basemapStyle}
+                onStyleChange={changeBasemapStyle}
+              />
             )}
           </>
         )}
       </div>
 
-      {/* Analysis Panel (right side) */}
-      <div className={`analysis-panel ${showAnalysisPanel ? 'open' : ''}`}>
-        <button 
-          className="analysis-toggle"
-          onClick={() => {
-            setShowAnalysisPanel(!showAnalysisPanel);
-            if (!showAnalysisPanel && !graphStats) {
-              computeStatistics();
-            }
-          }}
-        >
-          {showAnalysisPanel ? '▶' : '◀'} Analysis
-        </button>
+      <AnalysisPanel
+        isOpen={showAnalysisPanel}
+        onToggle={() => setShowAnalysisPanel(!showAnalysisPanel)}
+        graphStats={graphStats}
+        isComputing={isComputing}
+        colorMode={colorMode}
+        onComputeStatistics={computeStatistics}
+        onSetColorMode={setColorMode}
+        onSelectGiantComponent={selectGiantComponent}
+        onRemoveIsolatedNodes={removeIsolatedNodes}
+        onKeepOnlyGiantComponent={keepOnlyGiantComponent}
+      />
 
-        {showAnalysisPanel && (
-          <div className="analysis-content">
-            <h3>Graph Analysis</h3>
-            
-            {isComputing ? (
-              <div className="computing">Computing...</div>
-            ) : graphStats ? (
-              <>
-                <div className="stat-group">
-                  <div className="stat-row">
-                    <span className="stat-label">Nodes</span>
-                    <span className="stat-value">{graphStats.nodeCount.toLocaleString()}</span>
-                  </div>
-                  <div className="stat-row">
-                    <span className="stat-label">Edges</span>
-                    <span className="stat-value">{graphStats.edgeCount.toLocaleString()}</span>
-                  </div>
-                  <div className="stat-row">
-                    <span className="stat-label">Avg Degree</span>
-                    <span className="stat-value">{graphStats.avgDegree.toFixed(2)}</span>
-                  </div>
-                </div>
+      <DataLayersPanel
+        isOpen={showRecipesPanel}
+        onToggle={() => setShowRecipesPanel(!showRecipesPanel)}
+        activeDatasets={activeDatasets}
+        onAddRecipe={addRecipeDatasets}
+        onToggleDataset={toggleDataset}
+        onRemoveDataset={removeDataset}
+        onAddCustomDataset={addCustomDataset}
+        datasetLoading={datasetLoading}
+        datasetError={datasetError}
+        onClearError={clearError}
+        showZoomWarning={showZoomWarning}
+      />
 
-                <div className="stat-group">
-                  <h4>Connectivity</h4>
-                  <div className="stat-row">
-                    <span className="stat-label">Components</span>
-                    <span className="stat-value">{graphStats.numComponents.toLocaleString()}</span>
-                  </div>
-                  <div className="stat-row highlight">
-                    <span className="stat-label">Giant Component</span>
-                    <span className="stat-value">
-                      {graphStats.giantComponentSize.toLocaleString()}
-                      <small> ({graphStats.giantComponentPercent.toFixed(1)}%)</small>
-                    </span>
-                  </div>
-                  <div className="stat-row">
-                    <span className="stat-label">Isolated Nodes</span>
-                    <span className="stat-value">{graphStats.isolatedNodes.toLocaleString()}</span>
-                  </div>
-                </div>
-
-                <div className="action-group">
-                  <h4>Visualization</h4>
-                  <button
-                    onClick={() => setColorMode(colorMode === 1 ? 0 : 1)}
-                    className={colorMode === 1 ? 'active' : ''}
-                  >
-                    {colorMode === 1 ? '● ' : '○ '}
-                    Color All Components
-                  </button>
-                  <button
-                    onClick={() => setColorMode(colorMode === 2 ? 0 : 2)}
-                    className={colorMode === 2 ? 'active highlight-giant' : ''}
-                  >
-                    {colorMode === 2 ? '● ' : '○ '}
-                    Highlight Giant Only
-                  </button>
-                  <button onClick={selectGiantComponent}>
-                    Select Giant Component
-                  </button>
-                </div>
-
-                <div className="action-group">
-                  <h4>Clean Up</h4>
-                  <button onClick={removeIsolatedNodes}>
-                    Remove Isolated Nodes
-                  </button>
-                  <button onClick={keepOnlyGiantComponent} className="destructive">
-                    Keep Only Giant Component
-                  </button>
-                </div>
-
-                <button className="refresh-btn" onClick={computeStatistics}>
-                  ↻ Refresh Statistics
-                </button>
-              </>
-            ) : (
-              <button onClick={computeStatistics}>Compute Statistics</button>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* Recipes Panel (left side) */}
-      <div className={`recipes-panel ${showRecipesPanel ? 'open' : ''}`}>
-        <button 
-          className="recipes-toggle"
-          onClick={() => setShowRecipesPanel(!showRecipesPanel)}
-        >
-          Data {showRecipesPanel ? '◀' : '▶'}
-        </button>
-
-        {showRecipesPanel && (
-          <div className="recipes-content">
-            <h3>Data Layers</h3>
-            
-            {/* Zoom warning */}
-            {rendererRef.current && rendererRef.current.camera.zoom < OVERLAY_ZOOM_THRESHOLD && (
-              <div className="zoom-warning">
-                ⚠️ Zoom in further to load overlay data
-              </div>
-            )}
-
-            {/* Active Datasets */}
-            {activeDatasets.length > 0 && (
-              <div className="active-datasets">
-                <h4>Active Layers</h4>
-                {activeDatasets.map(dataset => (
-                  <div key={dataset.id} className="dataset-item">
-                    <button
-                      className={`dataset-toggle ${dataset.enabled ? 'enabled' : ''}`}
-                      onClick={() => toggleDataset(dataset.id)}
-                      style={{ borderLeftColor: dataset.color }}
-                    >
-                      <span className="dataset-checkbox">
-                        {dataset.enabled ? '☑' : '☐'}
-                      </span>
-                      <span className="dataset-name">{dataset.name}</span>
-                      {datasetLoading === dataset.id && (
-                        <span className="loading-indicator">⋯</span>
-                      )}
-                    </button>
-                    <button
-                      className="dataset-remove"
-                      onClick={() => removeDataset(dataset.id)}
-                      title="Remove layer"
-                    >
-                      ×
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* Recipes */}
-            <div className="recipes-list">
-              <h4>Recipes</h4>
-              {RECIPES.map(recipe => (
-                <div key={recipe.id} className="recipe-item">
-                  <button
-                    className="recipe-btn"
-                    onClick={() => addRecipeDatasets(recipe)}
-                    disabled={recipe.datasets.every(d => 
-                      activeDatasets.some(a => a.id === d.id)
-                    )}
-                  >
-                    <span className="recipe-name">{recipe.name}</span>
-                    <small className="recipe-desc">{recipe.description}</small>
-                  </button>
-                </div>
-              ))}
-            </div>
-
-            {/* Custom Dataset */}
-            <div className="custom-dataset">
-              <h4>Add Custom Dataset</h4>
-              <input
-                type="text"
-                placeholder="Dataset name (optional)"
-                value={customDatasetName}
-                onChange={e => setCustomDatasetName(e.target.value)}
-              />
-              <input
-                type="text"
-                placeholder="Socrata URL or resource ID"
-                value={customDatasetUrl}
-                onChange={e => {
-                  setCustomDatasetUrl(e.target.value);
-                  setDatasetError(null);
-                }}
-              />
-              <div className="color-picker-row">
-                <label>Color:</label>
-                <input
-                  type="color"
-                  value={customDatasetColor}
-                  onChange={e => setCustomDatasetColor(e.target.value)}
-                />
-              </div>
-              <button onClick={addCustomDataset}>Add Dataset</button>
-              
-              {datasetError && (
-                <div className="dataset-error">{datasetError}</div>
-              )}
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Status bar */}
-      <div className="stats">
-        <span>{stats.nodes.toLocaleString()} nodes</span>
-        <span>{stats.edges.toLocaleString()} edges</span>
-        <span>{stats.fps} fps</span>
-        {selectionCount(selection) > 0 && (
-          <span className="selection-info">
-            {selection.nodes.size > 0 && `${selection.nodes.size} nodes`}
-            {selection.nodes.size > 0 && selection.edges.size > 0 && ', '}
-            {selection.edges.size > 0 && `${selection.edges.size} edges`}
-            {' selected'}
-          </span>
-        )}
-        {pendingEdgeSource !== null && (
-          <span className="mode-hint">Click target node to create edge</span>
-        )}
-        {mode === 'polygonSelect' && polygonPoints.length > 0 && (
-          <span className="mode-hint">
-            {polygonPoints.length} points • Double-click or Enter to select
-          </span>
-        )}
-        {mode === 'lassoSelect' && polygonPoints.length === 0 && (
-          <span className="mode-hint">Click and drag to draw selection</span>
-        )}
-      </div>
+      <StatusBar
+        nodeCount={stats.nodes}
+        edgeCount={stats.edges}
+        fps={stats.fps}
+        selection={selection}
+        mode={mode}
+        pendingEdgeSource={pendingEdgeSource}
+        polygonPointCount={polygonPoints.length}
+      />
 
       <canvas
         ref={canvasRef}
@@ -1307,14 +811,14 @@ function App() {
         onWheel={handleWheel}
         style={{ cursor: getCursor() }}
       />
-      
+
       {/* Overlay canvas for polygon/lasso drawing */}
       <canvas
         ref={overlayCanvasRef}
         className="overlay-canvas"
-        style={{ 
+        style={{
           pointerEvents: (mode === 'polygonSelect' || mode === 'lassoSelect') ? 'auto' : 'none',
-          cursor: getCursor() 
+          cursor: getCursor()
         }}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
