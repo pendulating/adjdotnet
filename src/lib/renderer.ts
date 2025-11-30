@@ -63,11 +63,13 @@ struct Node {
 
 @group(0) @binding(1) var<storage, read> nodes: array<Node>;
 @group(0) @binding(2) var<storage, read> selectionMask: array<u32>;
+@group(0) @binding(3) var<storage, read> componentMask: array<u32>; // Giant component mask
 
 struct VertexOutput {
   @builtin(position) position: vec4f,
   @location(0) uv: vec2f,
   @location(1) @interpolate(flat) selected: u32,
+  @location(2) @interpolate(flat) inGiantComponent: u32,
 };
 
 @vertex
@@ -81,6 +83,7 @@ fn vs_main(
   let wordIdx = iIdx / 32u;
   let bitIdx = iIdx % 32u;
   let isSelected = (selectionMask[wordIdx] >> bitIdx) & 1u;
+  let isInGiant = (componentMask[wordIdx] >> bitIdx) & 1u;
   
   var quadPos: array<vec2f, 6> = array<vec2f, 6>(
     vec2f(-1.0, -1.0),
@@ -113,22 +116,32 @@ fn vs_main(
   out.position = camera.projection * camera.view * worldPos;
   out.uv = quadUV[vIdx];
   out.selected = isSelected;
+  out.inGiantComponent = isInGiant;
   return out;
 }
 
 @fragment
-fn fs_main(@location(0) uv: vec2f, @location(1) @interpolate(flat) selected: u32) -> @location(0) vec4f {
+fn fs_main(
+  @location(0) uv: vec2f, 
+  @location(1) @interpolate(flat) selected: u32,
+  @location(2) @interpolate(flat) inGiantComponent: u32
+) -> @location(0) vec4f {
   let d = distance(uv, vec2f(0.5));
   if (d > 0.5) {
     discard;
   }
   let alpha = smoothstep(0.5, 0.35, d);
   
-  // Selected nodes are orange, normal nodes are blue
+  // Selected nodes are orange
   if (selected == 1u) {
     return vec4f(1.0, 0.6, 0.2, alpha); // Orange
   }
-  return vec4f(0.24, 0.63, 0.95, alpha); // Blue
+  
+  // In giant component: blue, outside: dim red (disconnected)
+  if (inGiantComponent == 1u) {
+    return vec4f(0.24, 0.63, 0.95, alpha); // Blue for connected/giant
+  }
+  return vec4f(0.85, 0.3, 0.35, alpha); // Red for disconnected
 }
 `;
 
@@ -252,6 +265,7 @@ export class WebGPURenderer {
   private uniformBuffer: GPUBuffer | null = null;
   private nodeSelectionBuffer: GPUBuffer | null = null;
   private edgeSelectionBuffer: GPUBuffer | null = null;
+  private componentMaskBuffer: GPUBuffer | null = null;
   private previewEdgeBuffer: GPUBuffer | null = null;
   private tileBindGroupLayout: GPUBindGroupLayout | null = null;
 
@@ -263,6 +277,10 @@ export class WebGPURenderer {
   // Selection state (bit-packed)
   private nodeSelectionMask: Uint32Array = new Uint32Array(0);
   private edgeSelectionMask: Uint32Array = new Uint32Array(0);
+  private componentMask: Uint32Array = new Uint32Array(0);
+  
+  // Component visualization
+  private showComponentColoring = false;
 
   // Preview edge (for addEdge mode)
   private previewEdgeVisible = false;
@@ -506,6 +524,7 @@ export class WebGPURenderer {
 
     this.nodeSelectionMask = new Uint32Array(nodeSelectionWords);
     this.edgeSelectionMask = new Uint32Array(edgeSelectionWords);
+    this.componentMask = new Uint32Array(nodeSelectionWords);
 
     this.nodeSelectionBuffer?.destroy();
     this.nodeSelectionBuffer = this.device.createBuffer({
@@ -518,6 +537,20 @@ export class WebGPURenderer {
       size: Math.max(edgeSelectionWords * 4, 4),
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
+
+    this.componentMaskBuffer?.destroy();
+    this.componentMaskBuffer = this.device.createBuffer({
+      size: Math.max(nodeSelectionWords * 4, 4),
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    // Initialize component mask - if coloring is disabled, all nodes shown as "in component"
+    if (!this.showComponentColoring) {
+      this.componentMask.fill(0xFFFFFFFF);
+      this.device.queue.writeBuffer(this.componentMaskBuffer, 0, this.componentMask);
+    } else {
+      this.updateComponentMask();
+    }
 
     // Uniform buffer
     if (!this.uniformBuffer) {
@@ -542,6 +575,7 @@ export class WebGPURenderer {
         { binding: 0, resource: { buffer: this.uniformBuffer } },
         { binding: 1, resource: { buffer: this.nodeBuffer } },
         { binding: 2, resource: { buffer: this.nodeSelectionBuffer } },
+        { binding: 3, resource: { buffer: this.componentMaskBuffer } },
       ],
     });
 
@@ -604,6 +638,47 @@ export class WebGPURenderer {
       this.previewEdgeStart = { x: startX, y: startY };
       this.previewEdgeEnd = { x: endX, y: endY };
     }
+  }
+
+  /**
+   * Enable/disable component coloring visualization
+   */
+  public setComponentColoring(enabled: boolean) {
+    this.showComponentColoring = enabled;
+    if (enabled) {
+      this.updateComponentMask();
+    } else {
+      // Fill all nodes as "in giant component" to show uniform color
+      this.componentMask.fill(0xFFFFFFFF);
+      if (this.componentMaskBuffer && this.device) {
+        this.device.queue.writeBuffer(this.componentMaskBuffer, 0, this.componentMask);
+      }
+    }
+  }
+
+  /**
+   * Update the component mask based on current graph state
+   */
+  public updateComponentMask() {
+    if (!this.device || !this.componentMaskBuffer) return;
+
+    const { componentIds, giantComponentId } = this.graphState.findGiantComponent();
+    
+    // Clear mask
+    this.componentMask.fill(0);
+    
+    // Set bits for nodes in giant component
+    for (let i = 0; i < this.graphState.nodeCount; i++) {
+      if (componentIds[i] === giantComponentId) {
+        const wordIdx = Math.floor(i / 32);
+        const bitIdx = i % 32;
+        if (wordIdx < this.componentMask.length) {
+          this.componentMask[wordIdx] |= (1 << bitIdx);
+        }
+      }
+    }
+
+    this.device.queue.writeBuffer(this.componentMaskBuffer, 0, this.componentMask);
   }
 
   private updateUniforms() {
@@ -861,6 +936,7 @@ export class WebGPURenderer {
     this.uniformBuffer?.destroy();
     this.nodeSelectionBuffer?.destroy();
     this.edgeSelectionBuffer?.destroy();
+    this.componentMaskBuffer?.destroy();
     this.previewEdgeBuffer?.destroy();
     this.tileTextures.forEach(tex => tex.destroy());
   }

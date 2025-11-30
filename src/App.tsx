@@ -24,6 +24,16 @@ interface NetworkMetadata {
   crs: string;
 }
 
+interface GraphStatistics {
+  nodeCount: number;
+  edgeCount: number;
+  numComponents: number;
+  giantComponentSize: number;
+  giantComponentPercent: number;
+  avgDegree: number;
+  isolatedNodes: number;
+}
+
 const BASEMAP_OPTIONS = [
   { id: 'cartoDark', label: 'Dark' },
   { id: 'cartoLight', label: 'Light' },
@@ -52,6 +62,12 @@ function App() {
   const [pendingEdgeSource, setPendingEdgeSource] = useState<number | null>(null);
   const [canUndo, setCanUndo] = useState(false);
   const [canRedo, setCanRedo] = useState(false);
+
+  // Analysis state
+  const [showAnalysisPanel, setShowAnalysisPanel] = useState(false);
+  const [graphStats, setGraphStats] = useState<GraphStatistics | null>(null);
+  const [showComponentColoring, setShowComponentColoring] = useState(false);
+  const [isComputing, setIsComputing] = useState(false);
 
   // Drag state
   const isDragging = useRef(false);
@@ -506,6 +522,74 @@ function App() {
     }
   }, [mode, pendingEdgeSource]);
 
+  // Analysis functions
+  const computeStatistics = useCallback(() => {
+    const graph = graphRef.current;
+    if (!graph) return;
+    
+    setIsComputing(true);
+    // Use setTimeout to not block UI
+    setTimeout(() => {
+      const stats = graph.computeStatistics();
+      setGraphStats(stats);
+      setIsComputing(false);
+    }, 10);
+  }, []);
+
+  const toggleComponentColoring = useCallback(() => {
+    const renderer = rendererRef.current;
+    if (!renderer) return;
+
+    const newValue = !showComponentColoring;
+    setShowComponentColoring(newValue);
+    renderer.setComponentColoring(newValue);
+  }, [showComponentColoring]);
+
+  const removeIsolatedNodes = useCallback(() => {
+    const graph = graphRef.current;
+    if (!graph) return;
+
+    setIsComputing(true);
+    setTimeout(() => {
+      const removed = graph.removeIsolatedNodes();
+      setIsComputing(false);
+      updateStats();
+      computeStatistics();
+      alert(`Removed ${removed} isolated nodes`);
+    }, 10);
+  }, [updateStats, computeStatistics]);
+
+  const keepOnlyGiantComponent = useCallback(() => {
+    const graph = graphRef.current;
+    if (!graph) return;
+
+    if (!confirm('This will remove all nodes not in the giant component. Continue?')) return;
+
+    setIsComputing(true);
+    setTimeout(() => {
+      const removed = graph.keepOnlyGiantComponent();
+      setIsComputing(false);
+      updateStats();
+      computeStatistics();
+      if (showComponentColoring) {
+        rendererRef.current?.updateComponentMask();
+      }
+      alert(`Removed ${removed} nodes from smaller components`);
+    }, 10);
+  }, [updateStats, computeStatistics, showComponentColoring]);
+
+  const selectGiantComponent = useCallback(() => {
+    const graph = graphRef.current;
+    if (!graph) return;
+
+    setIsComputing(true);
+    setTimeout(() => {
+      const giantNodes = graph.getGiantComponentNodes();
+      setSelection({ nodes: new Set(giantNodes), edges: new Set() });
+      setIsComputing(false);
+    }, 10);
+  }, []);
+
   if (error) {
     return (
       <div className="error-overlay">
@@ -587,6 +671,97 @@ function App() {
               </div>
             )}
           </>
+        )}
+      </div>
+
+      {/* Analysis Panel (right side) */}
+      <div className={`analysis-panel ${showAnalysisPanel ? 'open' : ''}`}>
+        <button 
+          className="analysis-toggle"
+          onClick={() => {
+            setShowAnalysisPanel(!showAnalysisPanel);
+            if (!showAnalysisPanel && !graphStats) {
+              computeStatistics();
+            }
+          }}
+        >
+          {showAnalysisPanel ? '▶' : '◀'} Analysis
+        </button>
+
+        {showAnalysisPanel && (
+          <div className="analysis-content">
+            <h3>Graph Analysis</h3>
+            
+            {isComputing ? (
+              <div className="computing">Computing...</div>
+            ) : graphStats ? (
+              <>
+                <div className="stat-group">
+                  <div className="stat-row">
+                    <span className="stat-label">Nodes</span>
+                    <span className="stat-value">{graphStats.nodeCount.toLocaleString()}</span>
+                  </div>
+                  <div className="stat-row">
+                    <span className="stat-label">Edges</span>
+                    <span className="stat-value">{graphStats.edgeCount.toLocaleString()}</span>
+                  </div>
+                  <div className="stat-row">
+                    <span className="stat-label">Avg Degree</span>
+                    <span className="stat-value">{graphStats.avgDegree.toFixed(2)}</span>
+                  </div>
+                </div>
+
+                <div className="stat-group">
+                  <h4>Connectivity</h4>
+                  <div className="stat-row">
+                    <span className="stat-label">Components</span>
+                    <span className="stat-value">{graphStats.numComponents.toLocaleString()}</span>
+                  </div>
+                  <div className="stat-row highlight">
+                    <span className="stat-label">Giant Component</span>
+                    <span className="stat-value">
+                      {graphStats.giantComponentSize.toLocaleString()}
+                      <small> ({graphStats.giantComponentPercent.toFixed(1)}%)</small>
+                    </span>
+                  </div>
+                  <div className="stat-row">
+                    <span className="stat-label">Isolated Nodes</span>
+                    <span className="stat-value">{graphStats.isolatedNodes.toLocaleString()}</span>
+                  </div>
+                </div>
+
+                <div className="action-group">
+                  <h4>Visualization</h4>
+                  <button
+                    onClick={toggleComponentColoring}
+                    className={showComponentColoring ? 'active' : ''}
+                  >
+                    {showComponentColoring ? '● ' : '○ '}
+                    Show Components
+                  </button>
+                  <button onClick={selectGiantComponent}>
+                    Select Giant Component
+                  </button>
+                </div>
+
+                <div className="action-group">
+                  <h4>Clean Up</h4>
+                  <button onClick={removeIsolatedNodes}>
+                    Remove Isolated Nodes
+                  </button>
+                  <button onClick={keepOnlyGiantComponent} className="destructive">
+                    Keep Only Giant Component
+                  </button>
+                </div>
+
+                <button className="refresh-btn" onClick={computeStatistics}>
+                  ↻ Refresh Statistics
+                </button>
+              </>
+            ) : (
+              <button onClick={computeStatistics}>Compute Statistics</button>
+            )}
+          </div>
         )}
       </div>
 

@@ -399,6 +399,228 @@ export class GraphState {
     };
   }
 
+  // ==================== CONNECTED COMPONENTS ====================
+
+  /**
+   * Compute connected components using BFS
+   * Returns component ID for each node (0-indexed)
+   */
+  public computeConnectedComponents(): {
+    componentIds: Int32Array;
+    componentSizes: number[];
+    numComponents: number;
+  } {
+    const componentIds = new Int32Array(this.nodeCount).fill(-1);
+    const componentSizes: number[] = [];
+    let currentComponent = 0;
+
+    // Build adjacency list for faster traversal
+    const adjacency = this.buildAdjacencyList();
+
+    for (let startNode = 0; startNode < this.nodeCount; startNode++) {
+      if (componentIds[startNode] !== -1) continue; // Already visited
+
+      // BFS from startNode
+      const queue: number[] = [startNode];
+      let size = 0;
+
+      while (queue.length > 0) {
+        const node = queue.shift()!;
+        if (componentIds[node] !== -1) continue;
+
+        componentIds[node] = currentComponent;
+        size++;
+
+        // Visit neighbors
+        for (const neighbor of adjacency[node]) {
+          if (componentIds[neighbor] === -1) {
+            queue.push(neighbor);
+          }
+        }
+      }
+
+      componentSizes.push(size);
+      currentComponent++;
+    }
+
+    return {
+      componentIds,
+      componentSizes,
+      numComponents: currentComponent,
+    };
+  }
+
+  /**
+   * Find the giant (largest) connected component
+   */
+  public findGiantComponent(): {
+    componentIds: Int32Array;
+    giantComponentId: number;
+    giantComponentSize: number;
+    componentSizes: number[];
+    numComponents: number;
+  } {
+    const { componentIds, componentSizes, numComponents } = this.computeConnectedComponents();
+
+    let giantId = 0;
+    let giantSize = 0;
+    for (let i = 0; i < componentSizes.length; i++) {
+      if (componentSizes[i] > giantSize) {
+        giantSize = componentSizes[i];
+        giantId = i;
+      }
+    }
+
+    return {
+      componentIds,
+      giantComponentId: giantId,
+      giantComponentSize: giantSize,
+      componentSizes,
+      numComponents,
+    };
+  }
+
+  /**
+   * Get all node indices in the giant component
+   */
+  public getGiantComponentNodes(): number[] {
+    const { componentIds, giantComponentId } = this.findGiantComponent();
+    const nodes: number[] = [];
+    for (let i = 0; i < this.nodeCount; i++) {
+      if (componentIds[i] === giantComponentId) {
+        nodes.push(i);
+      }
+    }
+    return nodes;
+  }
+
+  /**
+   * Build adjacency list for efficient neighbor lookups
+   */
+  public buildAdjacencyList(): number[][] {
+    const adjacency: number[][] = Array.from({ length: this.nodeCount }, () => []);
+    for (let i = 0; i < this.edgeCount; i++) {
+      const src = this.edgeSource[i];
+      const tgt = this.edgeTarget[i];
+      adjacency[src].push(tgt);
+      adjacency[tgt].push(src);
+    }
+    return adjacency;
+  }
+
+  /**
+   * Compute graph statistics
+   */
+  public computeStatistics(): {
+    nodeCount: number;
+    edgeCount: number;
+    numComponents: number;
+    giantComponentSize: number;
+    giantComponentPercent: number;
+    avgDegree: number;
+    isolatedNodes: number;
+  } {
+    const { componentSizes, numComponents, giantComponentSize } = this.findGiantComponent();
+    
+    // Count degree of each node
+    const degrees = new Uint32Array(this.nodeCount);
+    for (let i = 0; i < this.edgeCount; i++) {
+      degrees[this.edgeSource[i]]++;
+      degrees[this.edgeTarget[i]]++;
+    }
+
+    let isolatedNodes = 0;
+    let totalDegree = 0;
+    for (let i = 0; i < this.nodeCount; i++) {
+      if (degrees[i] === 0) isolatedNodes++;
+      totalDegree += degrees[i];
+    }
+
+    return {
+      nodeCount: this.nodeCount,
+      edgeCount: this.edgeCount,
+      numComponents,
+      giantComponentSize,
+      giantComponentPercent: this.nodeCount > 0 ? (giantComponentSize / this.nodeCount) * 100 : 0,
+      avgDegree: this.nodeCount > 0 ? totalDegree / this.nodeCount : 0,
+      isolatedNodes,
+    };
+  }
+
+  // ==================== ADJACENCY OPERATIONS ====================
+
+  /**
+   * Auto-connect nearby nodes within a distance threshold
+   */
+  public autoConnectNearby(maxDistance: number): number {
+    let edgesAdded = 0;
+    const adjacency = this.buildAdjacencyList();
+    const maxDistSq = maxDistance * maxDistance;
+
+    for (let i = 0; i < this.nodeCount; i++) {
+      for (let j = i + 1; j < this.nodeCount; j++) {
+        // Skip if already connected
+        if (adjacency[i].includes(j)) continue;
+
+        const dx = this.nodeX[i] - this.nodeX[j];
+        const dy = this.nodeY[i] - this.nodeY[j];
+        const distSq = dx * dx + dy * dy;
+
+        if (distSq <= maxDistSq) {
+          this.addEdge(i, j);
+          adjacency[i].push(j);
+          adjacency[j].push(i);
+          edgesAdded++;
+        }
+      }
+    }
+
+    return edgesAdded;
+  }
+
+  /**
+   * Remove isolated nodes (nodes with no edges)
+   */
+  public removeIsolatedNodes(): number {
+    const degrees = new Uint32Array(this.nodeCount);
+    for (let i = 0; i < this.edgeCount; i++) {
+      degrees[this.edgeSource[i]]++;
+      degrees[this.edgeTarget[i]]++;
+    }
+
+    // Remove from end to avoid index shifting issues
+    let removed = 0;
+    for (let i = this.nodeCount - 1; i >= 0; i--) {
+      if (degrees[i] === 0) {
+        this.removeNode(i);
+        removed++;
+      }
+    }
+
+    return removed;
+  }
+
+  /**
+   * Keep only the giant component, remove all other nodes
+   */
+  public keepOnlyGiantComponent(): number {
+    const { componentIds, giantComponentId } = this.findGiantComponent();
+    
+    // Find nodes NOT in giant component (in reverse order for safe removal)
+    const nodesToRemove: number[] = [];
+    for (let i = this.nodeCount - 1; i >= 0; i--) {
+      if (componentIds[i] !== giantComponentId) {
+        nodesToRemove.push(i);
+      }
+    }
+
+    for (const nodeIdx of nodesToRemove) {
+      this.removeNode(nodeIdx);
+    }
+
+    return nodesToRemove.length;
+  }
+
   // ==================== SERIALIZATION ====================
 
   public toJSON(): { nodes: NodeData[], edges: EdgeData[] } {
